@@ -77,3 +77,24 @@ pub fn send_paste(shift_insert: bool, cursor_back: Option<usize>) {
         send(&v);
     }
 }
+
+/// 순차 붙여넣기: 사용자가 Ctrl 을 아직 누르고 있으면 V 만 보내고, 이미 뗐으면 Ctrl+V 전체를 보냅니다.
+pub fn queue_paste(shift_insert: bool) {
+    let ctrl_held = unsafe { GetAsyncKeyState(VK_CONTROL as i32) } as u16 & 0x8000 != 0;
+    let v = if shift_insert {
+        let mut v = Vec::new();
+        if ctrl_held {
+            v.push(key(VK_CONTROL, true));
+        }
+        v.extend([key(VK_SHIFT, false), key(VK_INSERT, false), key(VK_INSERT, true), key(VK_SHIFT, true)]);
+        if ctrl_held {
+            v.push(key(VK_CONTROL, false));
+        }
+        v
+    } else if ctrl_held {
+        vec![key('V' as u16, false), key('V' as u16, true)]
+    } else {
+        vec![key(VK_CONTROL, false), key('V' as u16, false), key('V' as u16, true), key(VK_CONTROL, true)]
+    };
+    send(&v);
+}

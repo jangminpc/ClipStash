@@ -54,6 +54,25 @@ jobs:
           Stop-Process -Id $p.Id -Force
           Write-Host "OK"
 
+      - name: 글자 추출(OCR)·HTTPS 점검 (참고용)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 900, 200
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::White)
+          $font = New-Object System.Drawing.Font "Arial", 48
+          $g.DrawString("Hello ClipStash 2026", $font, [System.Drawing.Brushes]::Black, 20, 50)
+          $bmp.Save("ocr.bmp", [System.Drawing.Imaging.ImageFormat]::Bmp)
+          $exe = "target\release\clipstash.exe"
+          Start-Process $exe -ArgumentList "--ocr-test", "ocr.bmp", "ocr.txt" -Wait
+          Write-Host "OCR 결과:"; Get-Content ocr.txt -Encoding utf8
+          Start-Process $exe -ArgumentList "--net-test", "net.txt" -Wait
+          Write-Host "HTTPS 결과:"; Get-Content net.txt -Encoding utf8
+          if (-not ((Get-Content ocr.txt -Raw) -match "Hello")) { throw "OCR 결과에 Hello 가 없습니다" }
+          if (-not ((Get-Content net.txt -Raw) -match "HTTP 4")) { throw "HTTPS 요청이 예상과 다릅니다" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: clipstash-windows-x64

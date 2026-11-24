@@ -150,6 +150,22 @@ pub struct History {
     pub items: Vec<ClipItem>,
     #[serde(default)]
     pub next_id: u64,
+    /// 지운 항목의 해시(동기화 폴더의 다른 PC 기록이 다시 살려내지 않도록)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<String>,
+}
+
+/// 지운 항목 표시를 최대 몇 개까지 기억할지
+pub const MAX_TOMBSTONES: usize = 5000;
+
+#[derive(Debug, Default)]
+pub struct MergeOutcome {
+    /// 새로 들어와서 남은 항목 수(너무 오래되어 바로 밀려난 것은 빼고)
+    pub added: usize,
+    /// 다른 곳에서 지워져서 여기서도 지운 항목 + 개수 제한으로 밀려난 항목(이미지 파일 정리용)
+    pub removed: Vec<ClipItem>,
+    /// 기록이 실제로 달라졌는지(PC 끼리 쓸데없이 주고받지 않도록)
+    pub changed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -182,6 +198,8 @@ impl History {
         now: i64,
         max_items: usize,
     ) -> AddOutcome {
+        // 지웠던 내용을 다시 복사했으면 "지움" 표시를 없앱니다.
+        self.tombstones.retain(|t| *t != hash);
         if let Some(pos) = self.items.iter().position(|i| i.hash == hash) {
             let mut item = self.items.remove(pos);
             item.last_used = now;
@@ -242,7 +260,65 @@ impl History {
 
     pub fn remove(&mut self, id: u64) -> Option<ClipItem> {
         let pos = self.items.iter().position(|i| i.id == id)?;
-        Some(self.items.remove(pos))
+        let item = self.items.remove(pos);
+        self.add_tombstone(&item.hash);
+        Some(item)
+    }
+
+    fn add_tombstone(&mut self, hash: &str) {
+        if !self.tombstones.iter().any(|t| t == hash) {
+            self.tombstones.push(hash.to_string());
+            if self.tombstones.len() > MAX_TOMBSTONES {
+                let extra = self.tombstones.len() - MAX_TOMBSTONES;
+                self.tombstones.drain(..extra);
+            }
+        }
+    }
+
+    /// 다른 PC(동기화 폴더)나 백업 파일의 기록을 합칩니다.
+    /// 같은 내용(해시)은 한 번만 두고, `respect_tombstones` 이면 지운 항목은 다시 살리지 않으며
+    /// 상대가 지운 항목은 여기서도 지웁니다. 새 항목은 마지막 사용 시각에 맞는 자리에 들어갑니다.
+    pub fn merge(
+        &mut self,
+        items: &[ClipItem],
+        tombstones: &[String],
+        respect_tombstones: bool,
+        max_items: usize,
+    ) -> MergeOutcome {
+        let mut out = MergeOutcome::default();
+        if respect_tombstones {
+            for t in tombstones {
+                if let Some(pos) = self.items.iter().position(|i| &i.hash == t) {
+                    out.removed.push(self.items.remove(pos));
+                }
+                self.add_tombstone(t);
+            }
+        }
+        let mut new_ids = Vec::new();
+        for it in items {
+            if self.items.iter().any(|i| i.hash == it.hash) {
+                continue;
+            }
+            if respect_tombstones {
+                if self.tombstones.contains(&it.hash) {
+                    continue;
+                }
+            } else {
+                self.tombstones.retain(|t| t != &it.hash);
+            }
+            let mut item = it.clone();
+            item.id = self.alloc_id();
+            new_ids.push(item.id);
+            let pos = self.items.iter().position(|i| i.last_used < item.last_used).unwrap_or(self.items.len());
+            self.items.insert(pos, item);
+        }
+        let removed_before = out.removed.len();
+        out.removed.extend(self.trim(max_items));
+        out.added = new_ids.iter().filter(|id| self.get(**id).is_some()).count();
+        out.changed = out.added > 0
+            || removed_before > 0
+            || out.removed[removed_before..].iter().any(|r| !new_ids.contains(&r.id));
+        out
     }
 
     pub fn toggle_pin(&mut self, id: u64) -> Option<bool> {
@@ -268,6 +344,9 @@ impl History {
     pub fn clear_unpinned(&mut self) -> Vec<ClipItem> {
         let (keep, gone): (Vec<_>, Vec<_>) = self.items.drain(..).partition(|i| i.pinned);
         self.items = keep;
+        for g in &gone {
+            self.add_tombstone(&g.hash);
+        }
         gone
     }
 
@@ -387,6 +466,41 @@ mod tests {
         assert_eq!(h.merge_text(&[c, a], ", ").as_deref(), Some("첫째, 셋째"));
         assert_eq!(h.merge_text(&[img], "\n"), None);
         assert_eq!(h.merge_text(&[], "\n"), None);
+    }
+
+    #[test]
+    fn merge_respects_tombstones_and_order() {
+        let mut a = History::new();
+        add_text(&mut a, "old", 10, 100);
+        add_text(&mut a, "new", 30, 100);
+        let gone = add_text(&mut a, "deleted here", 20, 100).id;
+        a.remove(gone);
+
+        let mut b = History::new();
+        add_text(&mut b, "deleted here", 20, 100);
+        add_text(&mut b, "middle", 20, 100);
+        add_text(&mut b, "new", 40, 100);
+        let b_old = a.items.iter().find(|i| i.content == ClipContent::text("old")).unwrap().hash.clone();
+
+        let out = a.merge(&b.items, &[b_old], true, 100);
+        assert_eq!(out.added, 1, "only 'middle' is new");
+        assert_eq!(out.removed.len(), 1, "'old' was deleted on the other PC");
+        let texts: Vec<String> = a.items.iter().map(|i| i.content.as_plain_text().unwrap()).collect();
+        assert_eq!(texts, ["new", "middle"]);
+        let ids: Vec<u64> = a.items.iter().map(|i| i.id).collect();
+        assert_ne!(ids[0], ids[1]);
+
+        assert!(out.changed);
+        // 다시 합쳐도 달라지는 것이 없음
+        assert!(!a.merge(&b.items, &[], true, 100).changed);
+        // 개수 제한 때문에 바로 밀려나는 오래된 항목만 있으면 "바뀌지 않음"
+        let mut c = History::new();
+        add_text(&mut c, "ancient", 1, 100);
+        assert!(!a.merge(&c.items, &[], true, 2).changed);
+        // 백업에서 가져오기는 지운 항목도 되살립니다.
+        let out = a.merge(&b.items, &[], false, 100);
+        assert_eq!(out.added, 1);
+        assert!(!a.tombstones.iter().any(|t| *t == crate::hash::content_hash("text", b"deleted here")));
     }
 
     #[test]
