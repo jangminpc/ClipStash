@@ -18,6 +18,7 @@ pub enum PopupPosition {
 #[serde(default)]
 pub struct Config {
     pub hotkey: String,
+    pub double_copy_ms: u32,
     pub max_items: usize,
     pub capture_text: bool,
     pub capture_images: bool,
@@ -43,6 +44,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hotkey: "Ctrl+Shift+V".into(),
+            double_copy_ms: 400,
             max_items: 300,
             capture_text: true,
             capture_images: true,
@@ -112,7 +114,26 @@ impl Config {
         c.popup_width = c.popup_width.clamp(240, 2000);
         c.popup_height = c.popup_height.clamp(200, 2000);
         c.font_size = c.font_size.clamp(6, 40);
+        if c.double_copy_ms != 0 {
+            c.double_copy_ms = c.double_copy_ms.clamp(150, 1500);
+        }
         Ok(c)
+    }
+
+    /// 사람이 읽는 팝업 단축키 설명(트레이 메뉴/풍선 도움말용)
+    pub fn shortcut_label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.double_copy_ms > 0 {
+            parts.push("Ctrl+C 두 번".to_string());
+        }
+        if !self.hotkey.trim().is_empty() {
+            parts.push(self.hotkey.clone());
+        }
+        if parts.is_empty() {
+            "트레이 아이콘 클릭".into()
+        } else {
+            parts.join(" 또는 ")
+        }
     }
 
     /// 이 프로그램 이름(예: "KeePass.exe" 또는 "keepass")이 제외 목록에 있는지.
@@ -131,7 +152,11 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ClipStash 설정 파일
 # 저장하면 다음에 팝업을 열 때 자동으로 다시 읽습니다.
 # (트레이 메뉴 → "설정 다시 불러오기" 로 바로 적용할 수도 있습니다)
 
-# 기록 팝업을 여는 전역 단축키. 예: "Ctrl+Shift+V", "Alt+C", "Ctrl+`", "F9"
+# Ctrl+C 를 빠르게 두 번 누르면 기록 팝업 열기(한 번 누르면 평소처럼 복사만).
+# 두 번 누르는 사이 허용 시간(밀리초). 0 이면 끔.
+double_copy_ms = 400
+
+# 기록 팝업을 여는 추가 단축키. 예: "Ctrl+Shift+V", "Alt+C", "Ctrl+`", "F9", 끄려면 ""
 hotkey = "Ctrl+Shift+V"
 
 # 보관할 기록 개수(고정한 항목은 개수에 포함되지 않고 지워지지도 않습니다)
@@ -231,6 +256,18 @@ mod tests {
         assert_eq!(c.max_items, 10); // 최소값으로 보정
         assert_eq!(c.popup_position, PopupPosition::Mouse);
         assert_eq!(c.hotkey, "Ctrl+Shift+V");
+    }
+
+    #[test]
+    fn shortcut_labels() {
+        let mut c = Config::default();
+        assert_eq!(c.shortcut_label(), "Ctrl+C 두 번 또는 Ctrl+Shift+V");
+        c.hotkey = String::new();
+        assert_eq!(c.shortcut_label(), "Ctrl+C 두 번");
+        c.double_copy_ms = 0;
+        assert_eq!(c.shortcut_label(), "트레이 아이콘 클릭");
+        let c = Config::from_toml("double_copy_ms = 50").unwrap();
+        assert_eq!(c.double_copy_ms, 150);
     }
 
     #[test]

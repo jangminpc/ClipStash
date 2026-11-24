@@ -7,13 +7,15 @@ mod util;
 
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use clipstash::config::{Config, DEFAULT_CONFIG_TOML};
 use clipstash::history::{ClipContent, History};
 use clipstash::template::{self, Template};
 use clipstash::transform::Transform;
+use clipstash::hotkey::DoubleTap;
 use clipstash::{bmp, hash, hotkey, storage};
 
 use windows_sys::Win32::Foundation::*;
@@ -24,7 +26,8 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_CONTROL,
+    VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -33,6 +36,7 @@ use util::wide;
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_SHOW: u32 = WM_APP + 2;
+pub const WM_APP_DOUBLE_COPY: u32 = WM_APP + 3;
 const HOTKEY_ID: i32 = 1;
 const TIMER_SAVE: usize = 1;
 const MAIN_CLASS: &str = "ClipStash.Main";
@@ -76,6 +80,7 @@ pub struct App {
     icon_normal: HICON,
     icon_paused: HICON,
     hotkey_ok: bool,
+    kb_hook: HHOOK,
     taskbar_created: u32,
     pub popup: popup::Popup,
 }
@@ -171,6 +176,7 @@ pub fn run() {
             icon_normal,
             icon_paused,
             hotkey_ok: false,
+            kb_hook: null_mut(),
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             popup: popup::Popup::default(),
         });
@@ -198,6 +204,7 @@ pub fn run() {
         AddClipboardFormatListener(main);
         a.tray(NIM_ADD);
         a.register_hotkey();
+        a.update_keyboard_hook();
         if let Some(e) = config_error {
             a.balloon("설정 파일 오류 — 기본 설정으로 시작합니다", &e, true);
         }
@@ -222,6 +229,10 @@ impl App {
                 UnregisterHotKey(self.main, HOTKEY_ID);
                 self.hotkey_ok = false;
             }
+            if self.config.hotkey.trim().is_empty() {
+                self.tray(NIM_MODIFY);
+                return;
+            }
             match hotkey::parse(&self.config.hotkey) {
                 Ok(hk) => {
                     let mods = hk.modifiers as HOT_KEY_MODIFIERS | MOD_NOREPEAT;
@@ -243,6 +254,27 @@ impl App {
         self.tray(NIM_MODIFY);
     }
 
+    /// "Ctrl+C 두 번" 감지용 키보드 훅을 설정에 맞게 켜고 끕니다.
+    /// 키를 가로채지는 않으므로 평소 복사는 그대로 동작합니다.
+    fn update_keyboard_hook(&mut self) {
+        DOUBLE_COPY_MS.store(self.config.double_copy_ms, Ordering::Relaxed);
+        unsafe {
+            if self.config.double_copy_ms > 0 && self.kb_hook.is_null() {
+                self.kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), self.hinst, 0);
+                if self.kb_hook.is_null() {
+                    self.balloon(
+                        "Ctrl+C 두 번 감지를 켜지 못했습니다",
+                        &format!("{} 로 팝업을 열어 주세요.", self.config.hotkey),
+                        true,
+                    );
+                }
+            } else if self.config.double_copy_ms == 0 && !self.kb_hook.is_null() {
+                UnhookWindowsHookEx(self.kb_hook);
+                self.kb_hook = null_mut();
+            }
+        }
+    }
+
     fn tray_data(&self) -> NOTIFYICONDATAW {
         let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -259,7 +291,7 @@ impl App {
         let tip = if self.paused {
             "ClipStash — 기록 일시정지됨".to_string()
         } else {
-            format!("ClipStash — 기록 {}개\n{} 로 열기", self.history.items.len(), self.config.hotkey)
+            format!("ClipStash — 기록 {}개\n{} 로 열기", self.history.items.len(), self.config.shortcut_label())
         };
         util::copy_to_buf(&mut nid.szTip, &tip);
         unsafe {
@@ -300,6 +332,9 @@ impl App {
             if self.hotkey_ok {
                 UnregisterHotKey(self.main, HOTKEY_ID);
             }
+            if !self.kb_hook.is_null() {
+                UnhookWindowsHookEx(self.kb_hook);
+            }
             let nid = self.tray_data();
             Shell_NotifyIconW(NIM_DELETE, &nid);
         }
@@ -328,6 +363,7 @@ impl App {
                 if hotkey_changed || !self.hotkey_ok {
                     self.register_hotkey();
                 }
+                self.update_keyboard_hook();
                 let evicted = self.history.trim(self.config.max_items);
                 if !evicted.is_empty() {
                     storage::delete_item_files(&self.data_dir, &evicted);
@@ -335,7 +371,7 @@ impl App {
                 }
                 popup::on_config_changed(self);
                 if force {
-                    self.balloon("설정을 다시 불러왔습니다", &format!("단축키: {}", self.config.hotkey), false);
+                    self.balloon("설정을 다시 불러왔습니다", &format!("팝업 열기: {}", self.config.shortcut_label()), false);
                 }
             }
             Err(e) => self.balloon("설정 파일 오류 — 이전 설정을 유지합니다", &e, true),
@@ -539,7 +575,7 @@ impl App {
                 AppendMenuW(m, flags, id, t.as_ptr());
             };
             let checked = |b: bool| if b { MF_CHECKED } else { MF_UNCHECKED };
-            add(MF_STRING, CMD_OPEN, &format!("기록 열기\t{}", self.config.hotkey));
+            add(MF_STRING, CMD_OPEN, &format!("기록 열기\t{}", self.config.shortcut_label()));
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING | checked(self.paused), CMD_PAUSE, "기록 일시정지");
             add(MF_STRING | checked(util::autostart_enabled()), CMD_AUTOSTART, "Windows 시작 시 자동 실행");
@@ -604,9 +640,9 @@ impl App {
                 util::message_box(
                     self.main,
                     &format!(
-                        "ClipStash {}\n가벼운 클립보드 기록 관리자\n\n단축키: {}\n데이터 폴더: {}",
+                        "ClipStash {}\n가벼운 클립보드 기록 관리자\n\n팝업 열기: {}\n데이터 폴더: {}",
                         env!("CARGO_PKG_VERSION"),
-                        self.config.hotkey,
+                        self.config.shortcut_label(),
                         self.data_dir.display()
                     ),
                     MB_ICONINFORMATION,
@@ -635,6 +671,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if a.popup.visible() {
                 popup::hide(a);
             } else {
+                popup::show(a, GetForegroundWindow(), false);
+            }
+            0
+        }
+        WM_APP_DOUBLE_COPY => {
+            if !a.popup.visible() {
                 popup::show(a, GetForegroundWindow(), false);
             }
             0
@@ -675,4 +717,60 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+// ── Ctrl+C 두 번 감지 ─────────────────────────────────────────
+
+static DOUBLE_COPY_MS: AtomicU32 = AtomicU32::new(0);
+static C_HELD: AtomicBool = AtomicBool::new(false);
+static DOUBLE_TAP: Mutex<DoubleTap> = Mutex::new(DoubleTap::new());
+
+fn pressed(vk: u16) -> bool {
+    unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+}
+
+/// 저수준 키보드 훅. 키를 막지 않고 지켜보기만 하다가, Ctrl+C 가 짧은 간격으로
+/// 두 번 눌리면 메인 창에 알립니다. 훅은 빨리 끝나야 하므로 여기서는 메시지만 보냅니다.
+unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let k = &*(lp as *const KBDLLHOOKSTRUCT);
+        let msg = wp as u32;
+        let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let injected = k.flags & LLKHF_INJECTED != 0;
+        if !injected {
+            if k.vkCode == 'C' as u32 {
+                if down {
+                    // 꾹 누르고 있을 때 생기는 자동 반복은 무시
+                    let repeat = C_HELD.swap(true, Ordering::Relaxed);
+                    let only_ctrl = pressed(VK_CONTROL)
+                        && !pressed(VK_SHIFT)
+                        && !pressed(VK_MENU)
+                        && !pressed(VK_LWIN)
+                        && !pressed(VK_RWIN);
+                    if !repeat && only_ctrl {
+                        let window = DOUBLE_COPY_MS.load(Ordering::Relaxed);
+                        let hit = DOUBLE_TAP.lock().map(|mut d| d.press(k.time, window)).unwrap_or(false);
+                        if hit {
+                            let main = APP.load(Ordering::Relaxed);
+                            if !main.is_null() {
+                                PostMessageW((*main).main, WM_APP_DOUBLE_COPY, 0, 0);
+                            }
+                        }
+                    } else if !repeat {
+                        if let Ok(mut d) = DOUBLE_TAP.lock() {
+                            d.reset();
+                        }
+                    }
+                } else {
+                    C_HELD.store(false, Ordering::Relaxed);
+                }
+            } else if down && !matches!(k.vkCode, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C) {
+                // 사이에 다른 키를 누르면 처음부터 다시 셉니다(Ctrl/Shift/Alt/Win 은 제외)
+                if let Ok(mut d) = DOUBLE_TAP.lock() {
+                    d.reset();
+                }
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
 }

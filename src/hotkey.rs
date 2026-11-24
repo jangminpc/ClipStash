@@ -81,6 +81,41 @@ pub fn parse(s: &str) -> Result<Hotkey, String> {
     Ok(Hotkey { modifiers, vk })
 }
 
+/// "같은 키를 빠르게 두 번" 감지기. 시간은 밀리초(Windows 메시지 시각, 약 49일마다 한 바퀴 돎).
+#[derive(Debug, Default, Clone)]
+pub struct DoubleTap {
+    last: Option<u32>,
+}
+
+impl DoubleTap {
+    pub const fn new() -> Self {
+        DoubleTap { last: None }
+    }
+
+    /// 키를 누를 때마다 호출. 직전 누름과 `window_ms` 안이면 true 를 돌려주고 초기화합니다
+    /// (세 번 연속 눌러도 두 번째에서만 한 번 열리도록).
+    pub fn press(&mut self, now_ms: u32, window_ms: u32) -> bool {
+        if window_ms == 0 {
+            self.last = None;
+            return false;
+        }
+        match self.last {
+            Some(prev) if now_ms.wrapping_sub(prev) <= window_ms => {
+                self.last = None;
+                true
+            }
+            _ => {
+                self.last = Some(now_ms);
+                false
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +126,24 @@ mod tests {
         assert_eq!(parse("alt + c"), Ok(Hotkey { modifiers: MOD_ALT, vk: 'C' as u32 }));
         assert_eq!(parse("Win+`").unwrap().vk, 0xC0);
         assert_eq!(parse("F9"), Ok(Hotkey { modifiers: 0, vk: 0x78 }));
+    }
+
+    #[test]
+    fn double_tap() {
+        let mut d = DoubleTap::default();
+        assert!(!d.press(1000, 400));
+        assert!(d.press(1300, 400));
+        // 세 번째는 새로 시작
+        assert!(!d.press(1500, 400));
+        // 너무 느리면 아님
+        assert!(!d.press(2000, 400));
+        assert!(d.press(2400, 400));
+        // 시각이 한 바퀴 돌아도 동작
+        assert!(!d.press(u32::MAX - 100, 400));
+        assert!(d.press(100, 400));
+        // 0 = 끔
+        assert!(!d.press(0, 0));
+        assert!(!d.press(10, 0));
     }
 
     #[test]
