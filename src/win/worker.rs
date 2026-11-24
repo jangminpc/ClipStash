@@ -9,8 +9,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 pub const WM_APP_WORKER: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 10;
 
 pub enum Done {
-    /// 이미지에서 뽑은 글자
-    Ocr(Result<String, String>),
+    /// 이미지에서 뽑은 글자. (글자, 쓴 방법 설명) 또는 실패 이유
+    Ocr(Result<(String, String), String>),
     /// 카카오 로그인 결과
     KakaoAuth(Result<Token, String>),
     /// 카카오톡 보내기 결과(보낸 메시지 수). 토큰이 갱신되었으면 함께 돌려줌

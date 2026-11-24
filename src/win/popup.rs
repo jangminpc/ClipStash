@@ -1056,6 +1056,7 @@ const M_EDIT_CONFIG: usize = 133;
 const M_EDIT: usize = 140;
 const M_VIEW: usize = 141;
 const M_OCR: usize = 142;
+const M_OCR_WIN: usize = 147;
 const M_KAKAO: usize = 143;
 const M_QUEUE: usize = 144;
 const M_APP_ONLY: usize = 145;
@@ -1097,7 +1098,11 @@ fn context_menu(a: &mut App, screen: POINT) {
         if is_image {
             add(m, MF_SEPARATOR, 0, "");
             add(m, MF_STRING, M_VIEW, "크게 보기\tV");
-            add(m, MF_STRING, M_OCR, "글자 추출 (OCR)\tO");
+            let ai = !a.config.anthropic_api_key.trim().is_empty() || std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty());
+            add(m, MF_STRING, M_OCR, if ai { "AI 로 글자 추출\tO" } else { "글자 추출 (OCR)\tO" });
+            if ai {
+                add(m, MF_STRING, M_OCR_WIN, "Windows OCR 로 글자 추출(오프라인)\tShift+O");
+            }
         } else if n == 0 {
             add(m, MF_STRING, M_EDIT, "고쳐서 붙여넣기\tF2");
         }
@@ -1169,7 +1174,12 @@ fn context_menu(a: &mut App, screen: POINT) {
             }
             M_OCR => {
                 if let RowRef::Clip(id) = row {
-                    a.ocr_item(id)
+                    a.ocr_item(id, false)
+                }
+            }
+            M_OCR_WIN => {
+                if let RowRef::Clip(id) = row {
+                    a.ocr_item(id, true)
                 }
             }
             M_KAKAO => kakao_key(a),
@@ -1214,6 +1224,12 @@ fn handle_key(a: &mut App, vk: VIRTUAL_KEY) -> bool {
     let paste = if shift { Action::PastePlain } else { Action::Paste };
     match vk {
         VK_UP if shift => extend_marks(&mut a.popup, -1),
+        // Shift+O: 인터넷 없이 Windows 내장 OCR 로
+        k if shift && !ctrl && k == b'O' as u16 => {
+            if let Some(id) = selected_image(a) {
+                a.ocr_item(id, true);
+            }
+        }
         VK_DOWN if shift => extend_marks(&mut a.popup, 1),
         VK_SPACE | VK_INSERT => {
             toggle_mark(&mut a.popup);
@@ -1259,7 +1275,7 @@ fn handle_key(a: &mut App, vk: VIRTUAL_KEY) -> bool {
             }
             b'O' => {
                 if let Some(id) = selected_image(a) {
-                    a.ocr_item(id);
+                    a.ocr_item(id, false);
                 }
             }
             b'K' => kakao_key(a),

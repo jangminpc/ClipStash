@@ -53,6 +53,8 @@ pub struct Config {
     pub kakao_rest_api_key: String,
     pub kakao_client_secret: String,
     pub kakao_port: u16,
+    pub anthropic_api_key: String,
+    pub ai_ocr_model: String,
     pub templates: Vec<Template>,
 }
 
@@ -88,6 +90,8 @@ impl Default for Config {
             kakao_rest_api_key: String::new(),
             kakao_client_secret: String::new(),
             kakao_port: 8765,
+            anthropic_api_key: String::new(),
+            ai_ocr_model: crate::ai_ocr::DEFAULT_MODEL.into(),
             templates: vec![
                 Template {
                     name: "오늘 날짜".into(),
@@ -150,6 +154,9 @@ impl Config {
         c.popup_height = c.popup_height.clamp(200, 2000);
         c.font_size = c.font_size.clamp(6, 40);
         c.popup_opacity = c.popup_opacity.clamp(50, 100);
+        if c.ai_ocr_model.trim().is_empty() {
+            c.ai_ocr_model = crate::ai_ocr::DEFAULT_MODEL.into();
+        }
         if c.kakao_port < 1024 {
             c.kakao_port = 8765;
         }
@@ -274,6 +281,14 @@ kakao_rest_api_key = ""
 kakao_client_secret = ""
 # 카카오 앱에 등록할 Redirect URI 는 http://localhost:8765 (아래 숫자를 바꾸면 같이 바꾸기)
 kakao_port = 8765
+
+# ── AI 글자 추출 ───────────────────────────────────────────────
+# Anthropic(Claude) API 키를 넣으면 이미지 글자 추출(O)을 AI 로 합니다.
+# 한글·손글씨·표·복잡한 레이아웃을 훨씬 정확하게 읽습니다. 비워 두면 Windows 내장 OCR(오프라인)을 씁니다.
+# 키는 https://console.anthropic.com 에서 만들 수 있습니다(유료, README 의 "AI 글자 추출" 참고).
+anthropic_api_key = ""
+# 쓸 모델. 기본은 가장 정확한 claude-opus-5-5, 훨씬 싸게 쓰려면 "claude-haiku-5-5"
+ai_ocr_model = "claude-opus-5-5"
 
 # ── 템플릿(상용구) ─────────────────────────────────────────────
 # 팝업에서 Tab 키로 "템플릿" 탭으로 가서 고를 수 있습니다.

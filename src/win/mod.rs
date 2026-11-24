@@ -138,6 +138,17 @@ fn self_test() -> bool {
             out(&args[3], match r { Ok(t) => format!("OK\n{}", t), Err(e) => format!("ERR\n{}", e) });
             true
         }
+        Some("--ai-ocr-test") if args.len() >= 4 => {
+            // 키는 환경 변수 ANTHROPIC_API_KEY 에서
+            let data = std::fs::read(&args[2]).unwrap_or_default();
+            let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+            let r = bmp::bmp_to_dib(&data)
+                .and_then(ocr::dib_to_png_for_ai)
+                .ok_or_else(|| "이미지를 읽지 못함".to_string())
+                .and_then(|png| ocr::recognize_ai(&key, clipstash::ai_ocr::DEFAULT_MODEL, &png));
+            out(&args[3], match r { Ok(t) => format!("OK\n{}", t), Err(e) => format!("ERR\n{}", e) });
+            true
+        }
         Some("--net-test") if args.len() >= 3 => {
             let r = net::post_form(clipstash::kakao::AUTH_HOST, clipstash::kakao::TOKEN_PATH, None, "grant_type=refresh_token&client_id=x&refresh_token=x");
             out(&args[2], match r { Ok((st, b)) => format!("HTTP {}\n{}", st, b), Err(e) => format!("ERR\n{}", e) });
@@ -618,22 +629,54 @@ impl App {
     }
 
     /// 이미지 항목에서 글자 추출(결과는 새 텍스트 항목 + 클립보드)
-    pub fn ocr_item(&mut self, id: u64) {
+    pub fn ocr_item(&mut self, id: u64, windows_only: bool) {
         let Some(ClipContent::Image { file, .. }) = self.history.get(id).map(|i| i.content.clone()) else { return };
         popup::hide(self);
         let data = std::fs::read(storage::image_path(&self.data_dir, &file)).unwrap_or_default();
         match bmp::bmp_to_dib(&data) {
-            Some(dib) => self.ocr_dib(dib),
+            Some(dib) => self.ocr_dib_with(dib, windows_only),
             None => self.balloon("이미지를 읽지 못했습니다", "파일이 지워졌을 수 있습니다.", true),
         }
     }
 
     fn ocr_dib(&mut self, dib: &[u8]) {
+        self.ocr_dib_with(dib, false);
+    }
+
+    /// `windows_only` 이면 AI 키가 있어도 Windows 내장 OCR 만 씁니다(Shift+O).
+    pub fn ocr_dib_with(&mut self, dib: &[u8], windows_only: bool) {
         let Some((w, h, px)) = ocr::dib_to_bgra(dib, ocr::MAX_SIDE) else {
             self.balloon("글자 추출 실패", "이미지 형식을 읽지 못했습니다.", true);
             return;
         };
-        worker::spawn(self.main, move || worker::Done::Ocr(ocr::recognize(w, h, px)));
+        let key = self.ai_key();
+        let ai = match key {
+            Some(k) if !windows_only => ocr::dib_to_png_for_ai(dib).map(|png| (k, png)),
+            _ => None,
+        };
+        let model = self.config.ai_ocr_model.trim().to_string();
+        if ai.is_some() {
+            self.balloon("AI 로 글자를 읽는 중…", "보통 몇 초~수십 초 걸립니다. 끝나면 클립보드에 복사됩니다.", false);
+        }
+        worker::spawn(self.main, move || {
+            let win = |note: &str| ocr::recognize(w, h, px).map(|t| (t, note.to_string()));
+            worker::Done::Ocr(match ai {
+                Some((key, png)) => match ocr::recognize_ai(&key, &model, &png) {
+                    Ok(t) => Ok((t, format!("AI({})", model))),
+                    Err(e) => win(&format!("AI 실패 → Windows OCR 로 대신함: {}", e)).map_err(|e2| format!("{}\n(AI 도 실패: {})", e2, e)),
+                },
+                None => win("Windows OCR"),
+            })
+        });
+    }
+
+    /// AI 글자 추출용 키(설정 → 없으면 환경 변수 ANTHROPIC_API_KEY)
+    fn ai_key(&self) -> Option<String> {
+        let k = self.config.anthropic_api_key.trim();
+        if !k.is_empty() {
+            return Some(k.to_string());
+        }
+        std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty())
     }
 
     /// 편집한 글을 붙여넣고 기록에도 남깁니다.
@@ -824,13 +867,18 @@ impl App {
     fn on_worker_done(&mut self) {
         for d in worker::take() {
             match d {
-                worker::Done::Ocr(Ok(text)) => {
+                worker::Done::Ocr(Ok((text, how))) => {
                     let h = hash::content_hash("text", text.as_bytes());
                     let lines = text.lines().count();
                     let preview = clipstash::history::one_line(&text, 60);
                     self.add_entry(ClipContent::text(text.clone()), h, Some("글자 추출".into()), None);
                     clip::write(self.main, &self.formats, clip::Payload::Text { text: &text, html: None });
-                    self.balloon(&format!("글자를 추출했습니다 ({}줄)", lines), &format!("클립보드에 복사됨: {}", preview), false);
+                    let warn = how.starts_with("AI 실패");
+                    self.balloon(
+                        &format!("글자를 추출했습니다 ({}줄)", lines),
+                        &format!("{}\n클립보드에 복사됨: {}", how, preview),
+                        warn,
+                    );
                 }
                 worker::Done::Ocr(Err(e)) => self.balloon("글자 추출 실패", &e, true),
                 worker::Done::KakaoAuth(r) => {

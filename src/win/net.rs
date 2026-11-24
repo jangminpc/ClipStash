@@ -29,6 +29,15 @@ fn last_error(what: &str) -> String {
 
 /// `https://{host}{path}` 로 폼 데이터를 POST 하고 (상태 코드, 응답 본문)을 돌려줍니다.
 pub fn post_form(host: &str, path: &str, bearer: Option<&str>, body: &str) -> Result<(u32, String), String> {
+    let mut headers = vec!["Content-Type: application/x-www-form-urlencoded;charset=utf-8".to_string()];
+    if let Some(t) = bearer {
+        headers.push(format!("Authorization: Bearer {}", t));
+    }
+    post(host, path, &headers, body.as_bytes(), 20_000)
+}
+
+/// 일반 HTTPS POST. `headers` 는 "이름: 값" 줄들, `timeout_ms` 는 응답을 기다릴 최대 시간.
+pub fn post(host: &str, path: &str, headers: &[String], data: &[u8], timeout_ms: i32) -> Result<(u32, String), String> {
     unsafe {
         let agent = wide("ClipStash");
         let session = H(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0));
@@ -36,7 +45,7 @@ pub fn post_form(host: &str, path: &str, bearer: Option<&str>, body: &str) -> Re
             // Windows 8.1 이전은 AUTOMATIC_PROXY 를 모릅니다.
             return Err(last_error("인터넷 준비"));
         }
-        WinHttpSetTimeouts(session.0, 10_000, 10_000, 20_000, 20_000);
+        WinHttpSetTimeouts(session.0, 10_000, 10_000, timeout_ms, timeout_ms);
         let h = wide(host);
         let conn = H(WinHttpConnect(session.0, h.as_ptr(), INTERNET_DEFAULT_HTTPS_PORT, 0));
         if conn.0.is_null() {
@@ -48,12 +57,8 @@ pub fn post_form(host: &str, path: &str, bearer: Option<&str>, body: &str) -> Re
         if req.0.is_null() {
             return Err(last_error("요청 준비"));
         }
-        let mut headers = String::from("Content-Type: application/x-www-form-urlencoded;charset=utf-8\r\n");
-        if let Some(t) = bearer {
-            headers.push_str(&format!("Authorization: Bearer {}\r\n", t));
-        }
-        let hw: Vec<u16> = headers.encode_utf16().collect();
-        let data = body.as_bytes();
+        let joined: String = headers.iter().map(|h| format!("{}\r\n", h)).collect();
+        let hw: Vec<u16> = joined.encode_utf16().collect();
         if WinHttpSendRequest(
             req.0,
             hw.as_ptr(),
@@ -87,7 +92,7 @@ pub fn post_form(host: &str, path: &str, bearer: Option<&str>, body: &str) -> Re
                 break;
             }
             out.extend_from_slice(&buf[..read as usize]);
-            if out.len() > 1 << 20 {
+            if out.len() > 4 << 20 {
                 break;
             }
         }

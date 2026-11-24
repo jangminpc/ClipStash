@@ -4,6 +4,7 @@
 //! Linux/macOS 에서도 `cargo test` 로 검증할 수 있습니다.
 //! Windows 전용 코드(클립보드 감시, 팝업 창, 트레이 아이콘 등)는 `src/win/` 에 있습니다.
 
+pub mod ai_ocr;
 pub mod b64;
 pub mod backup;
 pub mod bmp;

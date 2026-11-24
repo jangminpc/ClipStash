@@ -8,6 +8,11 @@ use windows_sys::Win32::Graphics::Gdi::*;
 /// 클립보드 DIB → 위에서 아래 순서의 BGRA 픽셀. 형식 변환은 GDI 에 맡깁니다.
 /// 글자 인식이 잘 되도록 작은 그림은 2배로 키우고, 너무 큰 그림은 줄입니다.
 pub fn dib_to_bgra(dib: &[u8], max_side: u32) -> Option<(u32, u32, Vec<u8>)> {
+    dib_to_bgra_scaled(dib, max_side, true)
+}
+
+/// `upscale_small` 이면 작은 그림을 2배로 키웁니다(Windows OCR 용).
+pub fn dib_to_bgra_scaled(dib: &[u8], max_side: u32, upscale_small: bool) -> Option<(u32, u32, Vec<u8>)> {
     let (w, h) = clipstash::bmp::dib_size(dib)?;
     let off = clipstash::bmp::pixel_offset(dib)? as usize;
     if w == 0 || h == 0 || off >= dib.len() {
@@ -16,7 +21,7 @@ pub fn dib_to_bgra(dib: &[u8], max_side: u32) -> Option<(u32, u32, Vec<u8>)> {
     let big = w.max(h) as f64;
     let s = if big > max_side as f64 {
         max_side as f64 / big
-    } else if big < 600.0 {
+    } else if upscale_small && big < 600.0 {
         2.0
     } else {
         1.0
@@ -120,3 +125,44 @@ pub fn recognize(width: u32, height: u32, bgra: Vec<u8>) -> Result<String, Strin
 
 /// OCR 에 넘길 최대 크기(엔진 제한 10000 보다 넉넉히 작게)
 pub const MAX_SIDE: u32 = 4000;
+
+/// BGRA 픽셀 → PNG(RGB)
+fn encode_png(w: u32, h: u32, bgra: &[u8]) -> Option<Vec<u8>> {
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for px in bgra.as_chunks::<4>().0 {
+        rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Best);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(&rgb).ok()?;
+    }
+    Some(out)
+}
+
+/// 클립보드 DIB → AI 에 보낼 PNG(모델 최대 해상도와 크기 제한에 맞춤)
+pub fn dib_to_png_for_ai(dib: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = clipstash::bmp::dib_size(dib)?;
+    let mut side = (w.max(h) as f64 * clipstash::ai_ocr::fit_scale(w, h)) as u32;
+    for _ in 0..5 {
+        let (tw, th, px) = dib_to_bgra_scaled(dib, side.max(64), false)?;
+        let png = encode_png(tw, th, &px)?;
+        if png.len() <= clipstash::ai_ocr::MAX_IMAGE_BYTES {
+            return Some(png);
+        }
+        side = side * 3 / 4;
+    }
+    None
+}
+
+/// AI(Claude)로 글자 추출. 작업 스레드에서 부르세요.
+pub fn recognize_ai(api_key: &str, model: &str, png: &[u8]) -> Result<String, String> {
+    use clipstash::ai_ocr;
+    let body = ai_ocr::request_body(model, &clipstash::b64::encode(png));
+    let (status, resp) = super::net::post(ai_ocr::HOST, ai_ocr::PATH, &ai_ocr::headers(api_key, model), body.as_bytes(), 180_000)?;
+    ai_ocr::parse_response(status, &resp)
+}

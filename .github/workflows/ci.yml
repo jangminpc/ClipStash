@@ -57,6 +57,8 @@ jobs:
       - name: 글자 추출(OCR)·HTTPS 점검 (참고용)
         continue-on-error: true
         shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           Add-Type -AssemblyName System.Drawing
           $bmp = New-Object System.Drawing.Bitmap 900, 200
@@ -70,7 +72,13 @@ jobs:
           Write-Host "OCR 결과:"; Get-Content ocr.txt -Encoding utf8
           Start-Process $exe -ArgumentList "--net-test", "net.txt" -Wait
           Write-Host "HTTPS 결과:"; Get-Content net.txt -Encoding utf8
+          # AI 글자 추출: 저장소 비밀값 ANTHROPIC_API_KEY 가 있으면 실제로, 없으면 서버까지 요청이 가는지만(401) 확인
+          Start-Process $exe -ArgumentList "--ai-ocr-test", "ocr.bmp", "ai.txt" -Wait
+          Write-Host "AI 글자 추출 결과:"; Get-Content ai.txt -Encoding utf8
           if (-not ((Get-Content ocr.txt -Raw) -match "Hello")) { throw "OCR 결과에 Hello 가 없습니다" }
+          $ai = Get-Content ai.txt -Raw -Encoding utf8
+          if ($env:ANTHROPIC_API_KEY) { if (-not ($ai -match "Hello")) { throw "AI 글자 추출 결과가 예상과 다릅니다" } }
+          elseif (-not ($ai -match "API 키")) { throw "AI 서버 요청이 예상과 다릅니다" }
           if (-not ((Get-Content net.txt -Raw) -match "HTTP 4")) { throw "HTTPS 요청이 예상과 다릅니다" }
 
       - uses: actions/upload-artifact@v4
