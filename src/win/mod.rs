@@ -514,6 +514,29 @@ impl App {
         self.finish_paste(action == Action::CopyOnly, None);
     }
 
+    /// 여러 항목을 복사한 순서대로 이어 붙여서 한 번에 붙여넣기
+    pub fn use_many(&mut self, ids: &[u64], action: Action) {
+        let Some(mut text) = self.history.merge_text(ids, &self.config.merge_separator) else {
+            popup::hide(self);
+            self.balloon("붙여넣을 텍스트가 없습니다", "이미지는 여러 개를 한 번에 붙여넣을 수 없습니다.", false);
+            return;
+        };
+        if let Action::Transform(t) = action {
+            text = t.apply(&text);
+        }
+        if !clip::write(self.main, &self.formats, clip::Payload::Text { text: &text, html: None }) {
+            popup::hide(self);
+            self.balloon("클립보드에 넣지 못했습니다", "잠시 뒤 다시 해 보세요.", true);
+            return;
+        }
+        let now = util::now_unix();
+        for id in ids {
+            self.history.mark_used(*id, now, false);
+        }
+        self.mark_dirty();
+        self.finish_paste(action == Action::CopyOnly, None);
+    }
+
     /// 템플릿을 펼쳐서 붙여넣기
     pub fn use_template(&mut self, index: usize, action: Action) {
         let Some(t) = self.config.templates.get(index).cloned() else { return };

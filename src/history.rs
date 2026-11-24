@@ -271,6 +271,19 @@ impl History {
         gone
     }
 
+    /// 여러 항목의 텍스트를 **복사한 순서(오래된 것 → 최근 것)** 로 이어 붙입니다.
+    /// 이미지는 건너뛰고, 파일은 경로로 넣습니다. 붙일 것이 없으면 None.
+    pub fn merge_text(&self, ids: &[u64], separator: &str) -> Option<String> {
+        let parts: Vec<String> = self
+            .items
+            .iter()
+            .rev()
+            .filter(|i| ids.contains(&i.id))
+            .filter_map(|i| i.content.as_plain_text())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(separator))
+    }
+
     pub fn filter(&self, query: &str, view: View) -> Vec<&ClipItem> {
         let q = Query::new(query);
         self.items
@@ -358,6 +371,22 @@ mod tests {
         let gone = h.clear_unpinned();
         assert_eq!(gone.len(), 1);
         assert_eq!(h.items.len(), 1);
+    }
+
+    #[test]
+    fn merge_in_copy_order() {
+        let mut h = History::new();
+        let a = add_text(&mut h, "첫째", 0, 10).id;
+        let b = add_text(&mut h, "둘째", 1, 10).id;
+        let img = h
+            .add(ClipContent::Image { file: "x.bmp".into(), width: 1, height: 1 }, "img".into(), None, 2, 10)
+            .id;
+        let c = add_text(&mut h, "셋째", 3, 10).id;
+        // 고른 순서와 상관없이 복사한 순서대로, 이미지는 건너뜀
+        assert_eq!(h.merge_text(&[c, a, img, b], "\n").as_deref(), Some("첫째\n둘째\n셋째"));
+        assert_eq!(h.merge_text(&[c, a], ", ").as_deref(), Some("첫째, 셋째"));
+        assert_eq!(h.merge_text(&[img], "\n"), None);
+        assert_eq!(h.merge_text(&[], "\n"), None);
     }
 
     #[test]

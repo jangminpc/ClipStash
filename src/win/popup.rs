@@ -1,26 +1,26 @@
-//! 단축키로 뜨는 기록 팝업 창.
+//! 단축키(Ctrl+C 두 번 등)로 뜨는 기록 팝업 창.
 //!
-//! ┌───────────────────────────────┐
-//! │ 기록 120   고정 4   템플릿 3   │  ← 탭(Tab 키로 전환, 클릭 가능)
-//! │ [검색 (초성 가능: ㅎㄱ)      ] │  ← 입력하면 바로 걸러짐
-//! │ 1 ★ 회의록 정리 …   메모장·방금 │  ← 목록(직접 그림)
-//! │ 2   https://…      chrome·3분 전│
-//! │ ┌───────────────────────────┐ │
-//! │ │ 선택한 항목 미리보기         │ │  ← 텍스트/이미지/파일 목록
-//! │ └───────────────────────────┘ │
-//! │ Enter 붙여넣기 · Shift+Enter … │  ← 도움말
-//! └───────────────────────────────┘
+//! 단순하고 반투명한 디자인:
+//! ┌──────────────────────────────────────┐
+//! │  [ 검색…                ]  기록 고정 템플릿 │  ← 검색창 + 탭(Tab 키)
+//! │  1  회의록 정리 …           메모장 · 방금 │
+//! │ ❷  https://…              chrome · 3분 전 │  ← ❶❷ = 여러 개 고른 순서 표시
+//! │ ❶  안녕하세요               카톡 · 5분 전 │
+//! │  (F2 로 미리보기 켜기)                    │
+//! │  2개 선택됨 · Enter 한 번에 붙여넣기      │  ← 한 줄 도움말
+//! └──────────────────────────────────────┘
 
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use clipstash::config::PopupPosition;
+use clipstash::config::{PopupPosition, Theme};
 use clipstash::history::{relative_time, ClipContent, View};
 use clipstash::search::Query;
 use clipstash::transform::Transform;
 use clipstash::{bmp, storage};
 
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -37,19 +37,56 @@ const ID_LIST: usize = 11;
 
 const MAX_ROWS: usize = 2000;
 
-// 색
+// DWM 속성(Windows 11 에서 둥근 모서리/어두운 테두리). 이전 Windows 에서는 조용히 무시됩니다.
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+const DWMWA_BORDER_COLOR: u32 = 34;
+const DWMWCP_ROUND: u32 = 2;
+
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
-const C_BG: COLORREF = rgb(255, 255, 255);
-const C_TEXT: COLORREF = rgb(30, 32, 36);
-const C_MUTED: COLORREF = rgb(120, 126, 136);
-const C_ACCENT: COLORREF = rgb(38, 110, 220);
-const C_SEL: COLORREF = rgb(222, 235, 252);
-const C_PIN: COLORREF = rgb(232, 150, 0);
-const C_PREVIEW_BG: COLORREF = rgb(246, 247, 249);
-const C_LINE: COLORREF = rgb(228, 230, 234);
-const C_WARN: COLORREF = rgb(210, 60, 50);
+
+/// 테마 색상
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: COLORREF,
+    surface: COLORREF,
+    text: COLORREF,
+    muted: COLORREF,
+    accent: COLORREF,
+    on_accent: COLORREF,
+    sel: COLORREF,
+    pin: COLORREF,
+    line: COLORREF,
+    warn: COLORREF,
+}
+
+const DARK: Palette = Palette {
+    bg: rgb(30, 31, 34),
+    surface: rgb(45, 47, 52),
+    text: rgb(234, 236, 239),
+    muted: rgb(138, 143, 152),
+    accent: rgb(92, 160, 255),
+    on_accent: rgb(255, 255, 255),
+    sel: rgb(50, 64, 90),
+    pin: rgb(255, 190, 40),
+    line: rgb(60, 62, 68),
+    warn: rgb(255, 110, 100),
+};
+
+const LIGHT: Palette = Palette {
+    bg: rgb(252, 252, 253),
+    surface: rgb(239, 241, 244),
+    text: rgb(28, 30, 34),
+    muted: rgb(118, 124, 134),
+    accent: rgb(38, 110, 220),
+    on_accent: rgb(255, 255, 255),
+    sel: rgb(222, 234, 252),
+    pin: rgb(225, 145, 0),
+    line: rgb(226, 228, 232),
+    warn: rgb(210, 60, 50),
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Tab {
@@ -63,6 +100,13 @@ impl Tab {
     const ALL: [Tab; 3] = [Tab::History, Tab::Pinned, Tab::Templates];
     fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap()
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Tab::History => "기록",
+            Tab::Pinned => "고정",
+            Tab::Templates => "템플릿",
+        }
     }
 }
 
@@ -89,6 +133,9 @@ pub struct Popup {
     font: HFONT,
     font_bold: HFONT,
     font_small: HFONT,
+    bg_brush: HBRUSH,
+    surface_brush: HBRUSH,
+    pal: Palette,
     dpi: u32,
     font_h: i32,
     small_h: i32,
@@ -97,7 +144,10 @@ pub struct Popup {
     tab_rects: [RECT; 3],
     pub tab: Tab,
     pub rows: Vec<Row>,
+    /// 여러 개 붙여넣기용으로 고른 항목(고른 순서)
+    pub marks: Vec<u64>,
     pub target: HWND,
+    show_preview: bool,
     image_cache: Option<(u64, Vec<u8>)>,
 }
 
@@ -111,15 +161,20 @@ impl Default for Popup {
             font: null_mut(),
             font_bold: null_mut(),
             font_small: null_mut(),
+            bg_brush: null_mut(),
+            surface_brush: null_mut(),
+            pal: DARK,
             dpi: 0,
             font_h: 16,
             small_h: 14,
-            header_h: 32,
+            header_h: 40,
             footer_h: 24,
             tab_rects: [RECT { left: 0, top: 0, right: 0, bottom: 0 }; 3],
             tab: Tab::History,
             rows: Vec::new(),
+            marks: Vec::new(),
             target: null_mut(),
+            show_preview: false,
             image_cache: None,
         }
     }
@@ -151,6 +206,10 @@ impl Popup {
             util::from_wide(&buf)
         }
     }
+
+    fn mark_order(&self, id: u64) -> Option<usize> {
+        self.marks.iter().position(|m| *m == id)
+    }
 }
 
 pub fn register_classes(hinst: HINSTANCE) {
@@ -179,16 +238,18 @@ pub fn register_classes(hinst: HINSTANCE) {
 }
 
 static EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
+/// 처리한 키(Ctrl+Space 등)가 만드는 글자를 검색창에 넣지 않기 위한 표시
+static SWALLOW_CHAR: AtomicBool = AtomicBool::new(false);
 
 pub fn create(a: &mut App) {
     unsafe {
         let cls = wide(POPUP_CLASS);
         let title = wide("ClipStash");
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             cls.as_ptr(),
             title.as_ptr(),
-            WS_POPUP | WS_BORDER,
+            WS_POPUP,
             0,
             0,
             400,
@@ -213,7 +274,7 @@ pub fn create(a: &mut App) {
             a.hinst,
             null(),
         );
-        let cue = wide("검색… (초성 검색 가능: ㅎㄱ → 한국)");
+        let cue = wide("검색  (초성 OK: ㅎㄱ → 한국)");
         SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
         let old = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
         EDIT_PROC.store(old, Ordering::Relaxed);
@@ -241,7 +302,7 @@ pub fn create(a: &mut App) {
             0,
             pv_cls.as_ptr(),
             null(),
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD,
             0,
             0,
             10,
@@ -256,7 +317,38 @@ pub fn create(a: &mut App) {
         p.edit = edit;
         p.list = list;
         p.preview = preview;
+        // Windows 11: 둥근 모서리
+        let round = DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const u32 as *const _, 4);
+        apply_theme(a);
         set_dpi(a, 96);
+    }
+}
+
+/// 테마 색, 투명도, 스크롤바 모양을 설정에 맞춥니다.
+fn apply_theme(a: &mut App) {
+    let dark = a.config.theme == Theme::Dark;
+    let p = &mut a.popup;
+    p.pal = if dark { DARK } else { LIGHT };
+    p.show_preview = a.config.show_preview;
+    unsafe {
+        for b in [p.bg_brush, p.surface_brush] {
+            if !b.is_null() {
+                DeleteObject(b as HGDIOBJ);
+            }
+        }
+        p.bg_brush = CreateSolidBrush(p.pal.bg);
+        p.surface_brush = CreateSolidBrush(p.pal.surface);
+        let alpha = (a.config.popup_opacity as u32 * 255 / 100) as u8;
+        SetLayeredWindowAttributes(p.hwnd, 0, alpha, LWA_ALPHA);
+        let dark_flag: u32 = dark as u32;
+        DwmSetWindowAttribute(p.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_flag as *const u32 as *const _, 4);
+        let border = p.pal.line;
+        DwmSetWindowAttribute(p.hwnd, DWMWA_BORDER_COLOR, &border as *const u32 as *const _, 4);
+        // 목록 스크롤바도 테마에 맞게(Windows 10 1809 이상)
+        let theme = wide(if dark { "DarkMode_Explorer" } else { "Explorer" });
+        SetWindowTheme(p.list, theme.as_ptr(), null());
+        ShowWindow(p.preview, if p.show_preview { SW_SHOWNA } else { SW_HIDE });
     }
 }
 
@@ -268,7 +360,7 @@ fn make_font(name: &str, pt: u32, dpi: u32, bold: bool) -> HFONT {
             0,
             0,
             0,
-            if bold { FW_BOLD as i32 } else { FW_NORMAL as i32 },
+            if bold { FW_SEMIBOLD as i32 } else { FW_NORMAL as i32 },
             0,
             0,
             0,
@@ -294,6 +386,10 @@ fn text_height(hwnd: HWND, font: HFONT) -> i32 {
     }
 }
 
+fn row_height(p: &Popup) -> i32 {
+    p.font_h + p.scale(16)
+}
+
 /// DPI(또는 글꼴 설정)가 바뀌면 글꼴을 다시 만듭니다.
 fn set_dpi(a: &mut App, dpi: u32) {
     let p = &mut a.popup;
@@ -311,13 +407,29 @@ fn set_dpi(a: &mut App, dpi: u32) {
     p.font_small = make_font(&a.config.font_name, size.saturating_sub(1).max(6), dpi, false);
     p.font_h = text_height(p.hwnd, p.font);
     p.small_h = text_height(p.hwnd, p.font_small);
-    p.header_h = p.font_h * 2 + p.scale(4);
-    p.footer_h = p.small_h + p.scale(12);
+    p.header_h = p.font_h + p.scale(28);
+    p.footer_h = p.small_h + p.scale(14);
     unsafe {
         SendMessageW(p.edit, WM_SETFONT, p.font as WPARAM, 1);
-        let row_h = p.font_h + p.scale(14);
-        SendMessageW(p.list, LB_SETITEMHEIGHT, 0, row_h as LPARAM);
+        SendMessageW(p.list, LB_SETITEMHEIGHT, 0, row_height(p) as LPARAM);
     }
+}
+
+/// 탭 글자 영역의 너비(오른쪽 위)
+fn tabs_width(p: &Popup) -> i32 {
+    unsafe {
+        let dc = GetDC(p.hwnd);
+        let w: i32 = Tab::ALL.iter().map(|t| text_width(dc, t.name(), p.font_bold) + p.scale(14)).sum();
+        ReleaseDC(p.hwnd, dc);
+        w + p.scale(6)
+    }
+}
+
+/// 검색창 배경 상자(둥근 사각형)
+fn search_box(p: &Popup, client_w: i32) -> RECT {
+    let pad = p.scale(10);
+    let top = p.scale(10);
+    RECT { left: pad, top, right: client_w - pad - tabs_width(p), bottom: p.header_h - p.scale(6) }
 }
 
 fn layout(p: &mut Popup) {
@@ -325,16 +437,21 @@ fn layout(p: &mut Popup) {
         let mut rc: RECT = std::mem::zeroed();
         GetClientRect(p.hwnd, &mut rc);
         let (w, h) = (rc.right, rc.bottom);
-        let pad = p.scale(8);
-        let edit_h = p.font_h + p.scale(10);
-        let edit_y = p.header_h;
-        let list_y = edit_y + edit_h + p.scale(6);
+        let sb = search_box(p, w);
+        let inset = p.scale(10);
+        let edit_h = p.font_h + p.scale(2);
+        let edit_y = sb.top + (sb.bottom - sb.top - edit_h) / 2;
+        MoveWindow(p.edit, sb.left + inset, edit_y, sb.right - sb.left - 2 * inset, edit_h, 1);
+
+        let list_y = p.header_h + p.scale(4);
         let avail = h - list_y - p.footer_h;
-        let preview_h = (avail * 30 / 100).max(p.font_h * 4).min(avail / 2);
-        let list_h = avail - preview_h - p.scale(6);
-        MoveWindow(p.edit, pad + p.scale(4), edit_y + p.scale(4), w - 2 * pad - p.scale(8), edit_h - p.scale(8), 1);
-        MoveWindow(p.list, 0, list_y, w, list_h, 1);
-        MoveWindow(p.preview, pad, list_y + list_h + p.scale(6), w - 2 * pad, preview_h, 1);
+        let preview_h = if p.show_preview { (avail * 32 / 100).max(p.font_h * 4) } else { 0 };
+        let list_h = avail - preview_h;
+        MoveWindow(p.list, p.scale(6), list_y, w - p.scale(12), list_h, 1);
+        if p.show_preview {
+            let pad = p.scale(10);
+            MoveWindow(p.preview, pad, list_y + list_h + p.scale(4), w - 2 * pad, preview_h - p.scale(8), 1);
+        }
     }
 }
 
@@ -374,22 +491,25 @@ pub fn show(a: &mut App, target: HWND, at_mouse: bool) {
             y = wa.top + (wa.bottom - wa.top - h) / 2;
         } else {
             x = pt.x;
-            y = pt.y + caret_h + p.scale(2);
+            y = pt.y + caret_h + p.scale(4);
             if x + w > wa.right {
                 x = wa.right - w;
             }
             if y + h > wa.bottom {
                 // 아래 공간이 모자라면 위로
-                y = if caret_h > 0 { pt.y - h - p.scale(2) } else { wa.bottom - h };
+                y = if caret_h > 0 { pt.y - h - p.scale(4) } else { wa.bottom - h };
             }
         }
         x = x.max(wa.left);
         y = y.max(wa.top);
         SetWindowPos(p.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-        layout(p);
 
         p.tab = Tab::History;
+        p.marks.clear();
         p.image_cache = None;
+        p.show_preview = a.config.show_preview;
+        ShowWindow(p.preview, if p.show_preview { SW_SHOWNA } else { SW_HIDE });
+        layout(p);
         let empty = wide("");
         SetWindowTextW(p.edit, empty.as_ptr()); // EN_CHANGE → refresh
         refresh(a);
@@ -407,6 +527,7 @@ pub fn hide(a: &mut App) {
         unsafe { ShowWindow(p.hwnd, SW_HIDE) };
     }
     p.image_cache = None;
+    p.marks.clear();
 }
 
 /// 입력 커서(캐럿)의 화면 좌표. 많은 최신 프로그램(크롬 등)은 알려주지 않아 None 이 됩니다.
@@ -475,6 +596,9 @@ pub fn refresh(a: &mut App) {
                 .collect()
         }
     };
+    // 지워진 항목은 선택 목록에서도 뺍니다.
+    let history = &a.history;
+    a.popup.marks.retain(|id| history.get(*id).is_some());
     let p = &mut a.popup;
     let prev = p.selected();
     p.rows = rows;
@@ -486,6 +610,8 @@ pub fn refresh(a: &mut App) {
             SendMessageW(p.list, LB_SETCURSEL, keep, 0);
         }
         SendMessageW(p.list, WM_SETREDRAW, 1, 0);
+        // 비어 있으면 목록을 숨기고 팝업이 안내 문구를 그립니다.
+        ShowWindow(p.list, if p.rows.is_empty() { SW_HIDE } else { SW_SHOWNA });
         InvalidateRect(p.list, null(), 1);
         InvalidateRect(p.hwnd, null(), 0);
         InvalidateRect(p.preview, null(), 1);
@@ -499,6 +625,7 @@ pub fn on_history_changed(a: &mut App) {
 }
 
 pub fn on_config_changed(a: &mut App) {
+    apply_theme(a);
     let dpi = a.popup.dpi;
     set_dpi(a, dpi);
     if a.popup.visible() {
@@ -540,7 +667,49 @@ fn switch_tab(a: &mut App, tab: Tab) {
     select(&a.popup, 0);
 }
 
+fn redraw(p: &Popup) {
+    unsafe {
+        InvalidateRect(p.list, null(), 0);
+        InvalidateRect(p.hwnd, null(), 0);
+    }
+}
+
+/// 선택한 항목을 "여러 개 붙여넣기" 목록에 넣거나 뺍니다.
+fn toggle_mark(p: &mut Popup) {
+    if let Some(RowRef::Clip(id)) = p.selected() {
+        match p.mark_order(id) {
+            Some(i) => {
+                p.marks.remove(i);
+            }
+            None => p.marks.push(id),
+        }
+        redraw(p);
+    }
+}
+
+fn ensure_marked(p: &mut Popup) {
+    if let Some(RowRef::Clip(id)) = p.selected() {
+        if p.mark_order(id).is_none() {
+            p.marks.push(id);
+        }
+    }
+}
+
+/// Shift+↑/↓: 지나가는 항목을 차례로 골라 담습니다.
+fn extend_marks(p: &mut Popup, delta: isize) {
+    ensure_marked(p);
+    move_selection(p, delta);
+    ensure_marked(p);
+    redraw(p);
+}
+
 fn activate(a: &mut App, row: Option<RowRef>, action: Action) {
+    // 여러 개를 골라 두었으면 한 번에 붙여넣기
+    if !a.popup.marks.is_empty() {
+        let ids = a.popup.marks.clone();
+        a.use_many(&ids, action);
+        return;
+    }
     match row {
         Some(RowRef::Clip(id)) => a.use_clip(id, action),
         Some(RowRef::Template(i)) => a.use_template(i, action),
@@ -556,11 +725,20 @@ fn delete_selected(a: &mut App) {
     }
 }
 
+fn toggle_preview(a: &mut App) {
+    let p = &mut a.popup;
+    p.show_preview = !p.show_preview;
+    unsafe { ShowWindow(p.preview, if p.show_preview { SW_SHOWNA } else { SW_HIDE }) };
+    layout(p);
+    unsafe { InvalidateRect(p.hwnd, null(), 0) };
+}
+
 // ── 오른쪽 클릭 메뉴 ──────────────────────────────────────────
 
 const M_PASTE: usize = 100;
 const M_PLAIN: usize = 101;
 const M_COPY: usize = 102;
+const M_MARK: usize = 103;
 const M_TRANSFORM: usize = 110;
 const M_PIN: usize = 130;
 const M_TEMPLATE: usize = 131;
@@ -579,9 +757,16 @@ fn context_menu(a: &mut App, screen: POINT) {
             RowRef::Clip(id) => matches!(a.history.get(id).map(|i| &i.content), Some(ClipContent::Image { .. })),
             RowRef::Template(_) => false,
         };
-        add(m, MF_STRING, M_PASTE, "붙여넣기\tEnter");
+        let n = a.popup.marks.len();
+        if n > 0 {
+            add(m, MF_STRING, M_PASTE, &format!("고른 {}개 한 번에 붙여넣기\tEnter", n));
+        } else {
+            add(m, MF_STRING, M_PASTE, "붙여넣기\tEnter");
+        }
         if !is_image {
-            add(m, MF_STRING, M_PLAIN, "텍스트만 붙여넣기\tShift+Enter");
+            if n == 0 {
+                add(m, MF_STRING, M_PLAIN, "텍스트만 붙여넣기\tShift+Enter");
+            }
             let sub = CreatePopupMenu();
             for (i, t) in Transform::ALL.iter().enumerate() {
                 add(sub, MF_STRING, M_TRANSFORM + i, t.label());
@@ -593,6 +778,13 @@ fn context_menu(a: &mut App, screen: POINT) {
         add(m, MF_SEPARATOR, 0, "");
         match row {
             RowRef::Clip(id) => {
+                let marked = a.popup.mark_order(id).is_some();
+                add(
+                    m,
+                    MF_STRING,
+                    M_MARK,
+                    if marked { "여러 개 선택에서 빼기\tCtrl+Space" } else { "여러 개 선택에 넣기\tCtrl+Space" },
+                );
                 let pinned = a.history.get(id).map(|i| i.pinned).unwrap_or(false);
                 add(m, MF_STRING, M_PIN, if pinned { "고정 해제\tCtrl+P" } else { "고정\tCtrl+P" });
                 if !is_image {
@@ -617,6 +809,7 @@ fn context_menu(a: &mut App, screen: POINT) {
             M_PASTE => activate(a, Some(row), Action::Paste),
             M_PLAIN => activate(a, Some(row), Action::PastePlain),
             M_COPY => activate(a, Some(row), Action::CopyOnly),
+            M_MARK => toggle_mark(&mut a.popup),
             c if (M_TRANSFORM..M_TRANSFORM + Transform::ALL.len()).contains(&c) => {
                 activate(a, Some(row), Action::Transform(Transform::ALL[c - M_TRANSFORM]))
             }
@@ -668,18 +861,32 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
     let shift = key_down(VK_SHIFT);
     let paste = if shift { Action::PastePlain } else { Action::Paste };
     match vk {
+        VK_UP if shift => extend_marks(&mut a.popup, -1),
+        VK_DOWN if shift => extend_marks(&mut a.popup, 1),
         VK_UP => move_selection(&a.popup, -1),
         VK_DOWN => move_selection(&a.popup, 1),
         VK_PRIOR => move_selection(&a.popup, -page_rows(&a.popup)),
         VK_NEXT => move_selection(&a.popup, page_rows(&a.popup)),
         VK_HOME if ctrl => select(&a.popup, 0),
         VK_END if ctrl => select(&a.popup, isize::MAX),
+        VK_SPACE if ctrl => {
+            SWALLOW_CHAR.store(true, Ordering::Relaxed);
+            toggle_mark(&mut a.popup);
+            move_selection(&a.popup, 1);
+        }
+        VK_INSERT => {
+            toggle_mark(&mut a.popup);
+            move_selection(&a.popup, 1);
+        }
         VK_RETURN => {
             let row = a.popup.selected();
             activate(a, row, paste);
         }
         VK_ESCAPE => {
-            if a.popup.search_text().is_empty() {
+            if !a.popup.marks.is_empty() {
+                a.popup.marks.clear();
+                redraw(&a.popup);
+            } else if a.popup.search_text().is_empty() {
                 hide(a);
             } else {
                 clear_search(edit);
@@ -689,6 +896,7 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
             let i = a.popup.tab.index() as isize + if shift { -1 } else { 1 };
             switch_tab(a, Tab::ALL[i.rem_euclid(3) as usize]);
         }
+        VK_F2 => toggle_preview(a),
         VK_DELETE if shift || a.popup.search_text().is_empty() => delete_selected(a),
         VK_APPS => context_menu_at_selection(a),
         VK_F10 if shift => context_menu_at_selection(a),
@@ -726,8 +934,9 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
                 // Ctrl+1 … Ctrl+9, Ctrl+0 = 10번째
                 let idx = if d == b'0' { 9 } else { (d - b'1') as usize };
                 let row = a.popup.rows.get(idx).map(|r| r.r);
-                if row.is_some() {
-                    activate(a, row, paste);
+                if let Some(row) = row {
+                    a.popup.marks.clear();
+                    activate(a, Some(row), paste);
                 }
             }
             _ => return false,
@@ -745,6 +954,9 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
         }
         WM_CHAR => {
+            if SWALLOW_CHAR.swap(false, Ordering::Relaxed) {
+                return 0;
+            }
             // 위에서 처리한 키(Enter, Esc, Tab, Ctrl+문자)가 삑 소리나 이상한 글자를 내지 않도록.
             // Ctrl+V(0x16)/X(0x18)/Z(0x1A) 는 검색창 편집에 쓰므로 통과.
             let c = wp as u32;
@@ -780,6 +992,10 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     select(&a.popup, 0);
                 }
                 (ID_LIST, LBN_SELCHANGE) => {
+                    // Ctrl+클릭 = 여러 개 선택에 넣기/빼기
+                    if key_down(VK_CONTROL) {
+                        toggle_mark(&mut a.popup);
+                    }
                     InvalidateRect(a.popup.preview, null(), 1);
                     SetFocus(a.popup.edit);
                 }
@@ -820,7 +1036,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_MEASUREITEM => {
             let mis = &mut *(lp as *mut MEASUREITEMSTRUCT);
-            mis.itemHeight = (a.popup.font_h + a.popup.scale(14)) as u32;
+            mis.itemHeight = row_height(&a.popup) as u32;
             1
         }
         WM_DRAWITEM => {
@@ -845,10 +1061,11 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_CTLCOLOREDIT => {
             let dc = wp as HDC;
-            SetBkColor(dc, C_BG);
-            SetTextColor(dc, C_TEXT);
-            GetStockObject(WHITE_BRUSH) as LRESULT
+            SetBkColor(dc, a.popup.pal.surface);
+            SetTextColor(dc, a.popup.pal.text);
+            a.popup.surface_brush as LRESULT
         }
+        WM_CTLCOLORLISTBOX => a.popup.bg_brush as LRESULT,
         WM_CLOSE => {
             hide(a);
             0
@@ -857,10 +1074,25 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     }
 }
 
+// ── 그리기 ─────────────────────────────────────────────────────
+
 unsafe fn fill(dc: HDC, rc: &RECT, color: COLORREF) {
     let b = CreateSolidBrush(color);
     FillRect(dc, rc, b);
     DeleteObject(b as HGDIOBJ);
+}
+
+/// 테두리 없는 둥근 사각형 채우기
+unsafe fn fill_round(dc: HDC, rc: &RECT, radius: i32, color: COLORREF) {
+    let b = CreateSolidBrush(color);
+    let pen = CreatePen(PS_SOLID, 1, color);
+    let ob = SelectObject(dc, b as HGDIOBJ);
+    let op = SelectObject(dc, pen as HGDIOBJ);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(b as HGDIOBJ);
+    DeleteObject(pen as HGDIOBJ);
 }
 
 unsafe fn draw_text(dc: HDC, s: &str, rc: &mut RECT, color: COLORREF, font: HFONT, flags: DRAW_TEXT_FORMAT) {
@@ -878,121 +1110,131 @@ unsafe fn text_width(dc: HDC, s: &str, font: HFONT) -> i32 {
     rc.right
 }
 
-/// 위쪽 탭 줄, 검색창 테두리, 아래쪽 도움말을 그립니다.
+/// 검색창 상자, 탭, (비어 있을 때) 안내 문구, 아래쪽 한 줄 도움말을 그립니다.
 unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut ps);
     let p = &mut a.popup;
+    let pal = p.pal;
     let mut rc: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rc);
-    fill(dc, &rc, C_BG);
+    fill(dc, &rc, pal.bg);
 
-    // 탭
-    let counts = [
-        a.history.items.len(),
-        a.history.items.iter().filter(|i| i.pinned).count(),
-        a.config.templates.len(),
-    ];
-    let names = ["기록", "고정", "템플릿"];
-    let mut x = p.scale(12);
-    let tab_h = p.font_h + p.scale(10);
+    // 검색창 상자
+    let sb = search_box(p, rc.right);
+    fill_round(dc, &sb, p.scale(12), pal.surface);
+
+    // 탭(오른쪽 위, 글자만)
+    let mut x = sb.right + p.scale(6);
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let sel = *tab == p.tab;
-        let label = format!("{} {}", names[i], counts[i]);
         let font = if sel { p.font_bold } else { p.font };
-        let w = text_width(dc, &label, font) + p.scale(16);
-        let mut r = RECT { left: x, top: p.scale(4), right: x + w, bottom: p.scale(4) + tab_h };
+        let w = text_width(dc, tab.name(), p.font_bold) + p.scale(14);
+        let mut r = RECT { left: x, top: sb.top, right: x + w, bottom: sb.bottom };
         p.tab_rects[i] = r;
-        draw_text(dc, &label, &mut r, if sel { C_ACCENT } else { C_MUTED }, font, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        draw_text(dc, tab.name(), &mut r, if sel { pal.accent } else { pal.muted }, font, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if sel {
-            let bar = RECT { left: x + p.scale(6), top: r.bottom - p.scale(3), right: x + w - p.scale(6), bottom: r.bottom };
-            fill(dc, &bar, C_ACCENT);
+            let cx = (r.left + r.right) / 2;
+            let dot = RECT { left: cx - p.scale(8), top: r.bottom - p.scale(2), right: cx + p.scale(8), bottom: r.bottom };
+            fill_round(dc, &dot, p.scale(2), pal.accent);
         }
-        x += w + p.scale(4);
-    }
-    if a.paused {
-        let mut r = RECT { left: x, top: p.scale(4), right: rc.right - p.scale(12), bottom: p.scale(4) + tab_h };
-        draw_text(dc, "● 기록 일시정지됨", &mut r, C_WARN, p.font_small, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        x += w;
     }
 
-    // 검색창 테두리
-    let mut er: RECT = std::mem::zeroed();
-    GetWindowRect(p.edit, &mut er);
-    let mut tl = POINT { x: er.left, y: er.top };
-    let mut br = POINT { x: er.right, y: er.bottom };
-    ScreenToClient(hwnd, &mut tl);
-    ScreenToClient(hwnd, &mut br);
-    let m = p.scale(4);
-    let frame = RECT { left: tl.x - m, top: tl.y - m, right: br.x + m, bottom: br.y + m };
-    let b = CreateSolidBrush(C_LINE);
-    FrameRect(dc, &frame, b);
-    DeleteObject(b as HGDIOBJ);
+    // 비어 있을 때 안내
+    if p.rows.is_empty() {
+        let msg = match p.tab {
+            Tab::Pinned => "고정한 항목이 없어요\n기록에서 Ctrl+P 로 고정하세요",
+            Tab::Templates => "템플릿이 없어요\nCtrl+E 로 설정 파일에서 추가하세요",
+            Tab::History if !p.search_text().is_empty() => "검색 결과가 없어요",
+            Tab::History => "아직 기록이 없어요\n아무 글이나 복사(Ctrl+C)해 보세요",
+        };
+        let mut r = RECT { left: 0, top: p.header_h + p.scale(40), right: rc.right, bottom: rc.bottom - p.footer_h };
+        draw_text(dc, msg, &mut r, pal.muted, p.font, DT_CENTER | DT_WORDBREAK);
+    }
 
-    // 도움말
-    let hint = match p.tab {
-        Tab::Templates => "Enter 붙여넣기 · Ctrl+E 템플릿 편집 · Tab 탭 전환 · Esc 닫기",
-        _ => "Enter 붙여넣기 · Shift+Enter 텍스트만 · Ctrl+P 고정 · Del 삭제 · Tab 탭 · 우클릭 더보기",
+    // 아래쪽 한 줄 도움말
+    let n = p.marks.len();
+    let (hint, color) = if n > 0 {
+        (format!("{}개 선택됨  ·  Enter 한 번에 붙여넣기  ·  Esc 선택 해제", n), pal.accent)
+    } else {
+        let h = match p.tab {
+            Tab::Templates => "Enter 붙여넣기  ·  Tab 전환  ·  Ctrl+E 편집",
+            _ => "Enter 붙여넣기  ·  Ctrl+Space 여러 개  ·  Tab 전환  ·  F2 미리보기",
+        };
+        (h.to_string(), pal.muted)
     };
-    let line = RECT { left: 0, top: rc.bottom - p.footer_h, right: rc.right, bottom: rc.bottom - p.footer_h + 1 };
-    fill(dc, &line, C_LINE);
-    let mut r = RECT { left: p.scale(10), top: rc.bottom - p.footer_h, right: rc.right - p.scale(10), bottom: rc.bottom };
-    draw_text(dc, hint, &mut r, C_MUTED, p.font_small, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    let mut r = RECT {
+        left: p.scale(14),
+        top: rc.bottom - p.footer_h,
+        right: rc.right - p.scale(14),
+        bottom: rc.bottom - p.scale(2),
+    };
+    if a.paused {
+        let mut pr = r;
+        draw_text(dc, "● 일시정지", &mut pr, pal.warn, p.font_small, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        r.right -= text_width(dc, "● 일시정지", p.font_small) + p.scale(8);
+    }
+    draw_text(dc, &hint, &mut r, color, p.font_small, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     EndPaint(hwnd, &ps);
 }
 
 unsafe fn draw_row(a: &App, dis: &DRAWITEMSTRUCT) {
     let p = &a.popup;
+    let pal = p.pal;
     let dc = dis.hDC;
     let rc = dis.rcItem;
+    fill(dc, &rc, pal.bg);
     if dis.itemID == u32::MAX {
-        fill(dc, &rc, C_BG);
         return;
     }
     let Some(row) = p.rows.get(dis.itemID as usize) else { return };
     let selected = dis.itemState & ODS_SELECTED != 0;
-    fill(dc, &rc, if selected { C_SEL } else { C_BG });
+    let mark = match row.r {
+        RowRef::Clip(id) => p.mark_order(id),
+        RowRef::Template(_) => None,
+    };
     if selected {
-        let edge = RECT { left: rc.left, top: rc.top, right: rc.left + p.scale(3), bottom: rc.bottom };
-        fill(dc, &edge, C_ACCENT);
+        let r = RECT { left: rc.left + p.scale(4), top: rc.top + p.scale(1), right: rc.right - p.scale(4), bottom: rc.bottom - p.scale(1) };
+        fill_round(dc, &r, p.scale(10), pal.sel);
     }
-    let pad = p.scale(10);
+    let pad = p.scale(12);
     let mut x = rc.left + pad;
 
-    // 번호(Ctrl+1~0)
-    let num_w = p.scale(18);
-    if dis.itemID < 10 {
-        let n = (dis.itemID + 1) % 10;
-        let mut r = RECT { left: x, top: rc.top, right: x + num_w, bottom: rc.bottom };
-        draw_text(dc, &n.to_string(), &mut r, C_MUTED, p.font_small, DT_VCENTER | DT_SINGLELINE);
+    // 왼쪽: 여러 개 선택 순서(동그라미) 또는 번호(Ctrl+1~9)
+    let badge = p.scale(20);
+    let cy = (rc.top + rc.bottom) / 2;
+    if let Some(order) = mark {
+        let br = RECT { left: x, top: cy - badge / 2, right: x + badge, bottom: cy + badge / 2 };
+        fill_round(dc, &br, badge, pal.accent);
+        let mut tr = br;
+        draw_text(dc, &(order + 1).to_string(), &mut tr, pal.on_accent, p.font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else if dis.itemID < 9 {
+        let mut r = RECT { left: x, top: rc.top, right: x + badge, bottom: rc.bottom };
+        draw_text(dc, &(dis.itemID + 1).to_string(), &mut r, pal.muted, p.font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
-    x += num_w;
-
-    // 고정 표시
-    let pin_w = p.scale(18);
-    if row.pinned {
-        let mut r = RECT { left: x, top: rc.top, right: x + pin_w, bottom: rc.bottom };
-        draw_text(dc, "★", &mut r, C_PIN, p.font, DT_VCENTER | DT_SINGLELINE);
-    }
-    x += pin_w;
+    x += badge + p.scale(10);
 
     // 오른쪽 정보(프로그램 · 시간)
     let meta_w = text_width(dc, &row.meta, p.font_small).min((rc.right - rc.left) / 3);
     let mut mr = RECT { left: rc.right - pad - meta_w, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
-    draw_text(dc, &row.meta, &mut mr, C_MUTED, p.font_small, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    draw_text(dc, &row.meta, &mut mr, pal.muted, p.font_small, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    // 고정 표시
+    if row.pinned {
+        let w = text_width(dc, "★", p.font_small) + p.scale(6);
+        let mut r = RECT { left: x, top: rc.top, right: x + w, bottom: rc.bottom };
+        draw_text(dc, "★", &mut r, pal.pin, p.font_small, DT_VCENTER | DT_SINGLELINE);
+        x += w;
+    }
 
     // 본문
     let mut tr = RECT { left: x, top: rc.top, right: mr.left - p.scale(10), bottom: rc.bottom };
-    draw_text(
-        dc,
-        &row.title,
-        &mut tr,
-        if row.special { C_ACCENT } else { C_TEXT },
-        p.font,
-        DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-    );
+    let color = if row.special || mark.is_some() { pal.accent } else { pal.text };
+    draw_text(dc, &row.title, &mut tr, color, p.font, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
-/// 미리보기 칸: 텍스트, 파일 목록, 또는 이미지
+/// 미리보기 칸(F2): 텍스트, 파일 목록, 또는 이미지
 unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
@@ -1001,7 +1243,8 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let dc = BeginPaint(hwnd, &mut ps);
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut rc);
-            fill(dc, &rc, C_PREVIEW_BG);
+            fill(dc, &rc, a.popup.pal.bg);
+            fill_round(dc, &rc, a.popup.scale(12), a.popup.pal.surface);
             paint_preview(a, dc, rc);
             EndPaint(hwnd, &ps);
             0
@@ -1013,34 +1256,32 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 
 unsafe fn paint_preview(a: &mut App, dc: HDC, rc: RECT) {
     let p = &a.popup;
+    let pal = p.pal;
     let (font, small_h) = (p.font_small, p.small_h);
-    let pad = p.scale(8);
+    let pad = p.scale(10);
     let gap = p.scale(4);
     let mut inner = RECT { left: rc.left + pad, top: rc.top + pad, right: rc.right - pad, bottom: rc.bottom - pad };
     let info_h = small_h + gap;
     let mut info_r = RECT { left: inner.left, top: inner.bottom - small_h, right: inner.right, bottom: inner.bottom };
     let text_flags = DT_WORDBREAK | DT_EXPANDTABS | DT_EDITCONTROL | DT_END_ELLIPSIS;
 
-    let Some(row) = p.selected() else {
-        let msg = if p.rows.is_empty() {
-            match p.tab {
-                Tab::Pinned => "고정한 항목이 없습니다.\n기록 탭에서 Ctrl+P 로 자주 쓰는 항목을 고정하세요.",
-                Tab::Templates => "템플릿이 없습니다.\nCtrl+E 로 설정 파일을 열어 추가하세요.",
-                Tab::History if !p.search_text().is_empty() => "검색 결과가 없습니다.",
-                Tab::History => "기록이 없습니다.\n아무 글이나 복사(Ctrl+C)해 보세요.",
-            }
-        } else {
-            ""
-        };
-        draw_text(dc, msg, &mut inner, C_MUTED, font, text_flags);
+    // 여러 개를 골랐으면 합쳐질 결과를 보여 줍니다.
+    if p.marks.len() > 1 {
+        let merged = a.history.merge_text(&p.marks, &a.config.merge_separator).unwrap_or_default();
+        inner.bottom -= info_h;
+        draw_text(dc, &merged.chars().take(4000).collect::<String>(), &mut inner, pal.text, font, text_flags);
+        let info = format!("{}개를 복사한 순서대로 이어 붙입니다", p.marks.len());
+        draw_text(dc, &info, &mut info_r, pal.accent, font, DT_SINGLELINE | DT_END_ELLIPSIS);
         return;
-    };
+    }
+
+    let Some(row) = p.selected() else { return };
     inner.bottom -= info_h;
 
     let info = match row {
         RowRef::Template(i) => {
             let Some(t) = a.config.templates.get(i) else { return };
-            draw_text(dc, &t.text.replace("\r\n", "\n"), &mut inner, C_TEXT, font, text_flags);
+            draw_text(dc, &t.text.replace("\r\n", "\n"), &mut inner, pal.text, font, text_flags);
             format!("템플릿 · {}", t.group.as_deref().unwrap_or("그룹 없음"))
         }
         RowRef::Clip(id) => {
@@ -1048,7 +1289,7 @@ unsafe fn paint_preview(a: &mut App, dc: HDC, rc: RECT) {
             let mut info = match &item.content {
                 ClipContent::Text { text, html } => {
                     let shown: String = text.chars().take(4000).collect();
-                    draw_text(dc, &shown.replace("\r\n", "\n"), &mut inner, C_TEXT, font, text_flags);
+                    draw_text(dc, &shown.replace("\r\n", "\n"), &mut inner, pal.text, font, text_flags);
                     let mut s = format!("{}자 · {}줄", text.chars().count(), text.lines().count().max(1));
                     if html.is_some() {
                         s.push_str(" · 서식 포함");
@@ -1056,7 +1297,7 @@ unsafe fn paint_preview(a: &mut App, dc: HDC, rc: RECT) {
                     s
                 }
                 ClipContent::Files { paths } => {
-                    draw_text(dc, &paths.join("\n"), &mut inner, C_TEXT, font, text_flags);
+                    draw_text(dc, &paths.join("\n"), &mut inner, pal.text, font, text_flags);
                     format!("파일/폴더 {}개", paths.len())
                 }
                 ClipContent::Image { file, width, height } => {
@@ -1073,7 +1314,7 @@ unsafe fn paint_preview(a: &mut App, dc: HDC, rc: RECT) {
             info
         }
     };
-    draw_text(dc, &info, &mut info_r, C_MUTED, font, DT_SINGLELINE | DT_END_ELLIPSIS);
+    draw_text(dc, &info, &mut info_r, pal.muted, font, DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 unsafe fn paint_image(a: &mut App, dc: HDC, id: u64, file: &str, area: RECT) {

@@ -14,6 +14,13 @@ pub enum PopupPosition {
     Center,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    Dark,
+    Light,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -31,6 +38,10 @@ pub struct Config {
     pub move_to_top_on_paste: bool,
     pub ignore_whitespace_only: bool,
     pub popup_position: PopupPosition,
+    pub theme: Theme,
+    pub popup_opacity: u8,
+    pub show_preview: bool,
+    pub merge_separator: String,
     pub popup_width: u32,
     pub popup_height: u32,
     pub font_name: String,
@@ -57,8 +68,12 @@ impl Default for Config {
             move_to_top_on_paste: true,
             ignore_whitespace_only: true,
             popup_position: PopupPosition::Caret,
-            popup_width: 480,
-            popup_height: 540,
+            theme: Theme::Dark,
+            popup_opacity: 94,
+            show_preview: false,
+            merge_separator: "\n".into(),
+            popup_width: 440,
+            popup_height: 480,
             font_name: "맑은 고딕".into(),
             font_size: 10,
             excluded_apps: DEFAULT_EXCLUDED.iter().map(|s| s.to_string()).collect(),
@@ -114,6 +129,7 @@ impl Config {
         c.popup_width = c.popup_width.clamp(240, 2000);
         c.popup_height = c.popup_height.clamp(200, 2000);
         c.font_size = c.font_size.clamp(6, 40);
+        c.popup_opacity = c.popup_opacity.clamp(50, 100);
         if c.double_copy_ms != 0 {
             c.double_copy_ms = c.double_copy_ms.clamp(150, 1500);
         }
@@ -188,8 +204,18 @@ ignore_whitespace_only = true
 
 # 팝업 위치: "caret"(입력 커서 옆), "mouse"(마우스 위치), "center"(화면 가운데)
 popup_position = "caret"
-popup_width = 480
-popup_height = 540
+popup_width = 440
+popup_height = 480
+
+# 팝업 모양: "dark"(어두운 테마) 또는 "light"(밝은 테마)
+theme = "dark"
+# 팝업 불투명도(%). 100 이면 투명하지 않음, 낮을수록 뒤가 비침(50~100)
+popup_opacity = 94
+# 아래쪽 미리보기 칸을 처음부터 보이기(팝업에서 F2 로 켜고 끌 수 있음)
+show_preview = false
+
+# 여러 항목을 골라 한 번에 붙여넣을 때 항목 사이에 넣을 글자. "\n" = 줄바꿈, "" = 그냥 이어 붙이기, ", " 등
+merge_separator = "\n"
 font_name = "맑은 고딕"
 font_size = 10
 
