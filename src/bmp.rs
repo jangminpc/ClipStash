@@ -81,7 +81,7 @@ pub fn bgra_to_dib24(width: u32, height: u32, bgra: &[u8]) -> Option<Vec<u8>> {
     for y in (0..h).rev() {
         let row = &bgra[y * w * 4..(y + 1) * w * 4];
         let start = d.len();
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             d.extend_from_slice(&px[..3]);
         }
         d.resize(start + stride, 0);
