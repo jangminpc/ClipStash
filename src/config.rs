@@ -54,8 +54,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            hotkey: "Ctrl+Shift+V".into(),
-            double_copy_ms: 400,
+            hotkey: "Alt+C".into(),
+            double_copy_ms: 0,
             max_items: 300,
             capture_text: true,
             capture_images: true,
@@ -168,12 +168,12 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ClipStash 설정 파일
 # 저장하면 다음에 팝업을 열 때 자동으로 다시 읽습니다.
 # (트레이 메뉴 → "설정 다시 불러오기" 로 바로 적용할 수도 있습니다)
 
-# Ctrl+C 를 빠르게 두 번 누르면 기록 팝업 열기(한 번 누르면 평소처럼 복사만).
-# 두 번 누르는 사이 허용 시간(밀리초). 0 이면 끔.
-double_copy_ms = 400
+# 기록 팝업을 여는 단축키. 예: "Alt+C", "Ctrl+Shift+V", "Ctrl+`", "F9", 끄려면 ""
+hotkey = "Alt+C"
 
-# 기록 팝업을 여는 추가 단축키. 예: "Ctrl+Shift+V", "Alt+C", "Ctrl+`", "F9", 끄려면 ""
-hotkey = "Ctrl+Shift+V"
+# Ctrl+C 를 빠르게 두 번 눌러도 팝업 열기(한 번 누르면 평소처럼 복사만).
+# 두 번 누르는 사이 허용 시간(밀리초, 예: 400). 0 이면 끔.
+double_copy_ms = 0
 
 # 보관할 기록 개수(고정한 항목은 개수에 포함되지 않고 지워지지도 않습니다)
 max_items = 300
@@ -281,13 +281,15 @@ mod tests {
         let c = Config::from_toml("max_items = 5\npopup_position = \"mouse\"").unwrap();
         assert_eq!(c.max_items, 10); // 최소값으로 보정
         assert_eq!(c.popup_position, PopupPosition::Mouse);
-        assert_eq!(c.hotkey, "Ctrl+Shift+V");
+        assert_eq!(c.hotkey, "Alt+C");
     }
 
     #[test]
     fn shortcut_labels() {
         let mut c = Config::default();
-        assert_eq!(c.shortcut_label(), "Ctrl+C 두 번 또는 Ctrl+Shift+V");
+        assert_eq!(c.shortcut_label(), "Alt+C");
+        c.double_copy_ms = 400;
+        assert_eq!(c.shortcut_label(), "Ctrl+C 두 번 또는 Alt+C");
         c.hotkey = String::new();
         assert_eq!(c.shortcut_label(), "Ctrl+C 두 번");
         c.double_copy_ms = 0;
