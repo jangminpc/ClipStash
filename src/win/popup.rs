@@ -1,21 +1,21 @@
 //! 단축키(Ctrl+C 두 번 등)로 뜨는 기록 팝업 창.
 //!
-//! 단순하고 반투명한 디자인:
+//! 단순하고 반투명한 디자인(검색창 없음):
 //! ┌──────────────────────────────────────┐
-//! │  [ 검색…                ]  기록 고정 템플릿 │  ← 검색창 + 탭(Tab 키)
-//! │  1  회의록 정리 …           메모장 · 방금 │
+//! │  기록  고정  템플릿                        │  ← 탭(Tab 키)
+//! │  1  회의록 정리 …           메모장 · 방금 │  ← 숫자 키 1~9, 0 으로 바로 붙여넣기
+//! │  2  [▧▧] 이미지 1920×1080   캡처 · 1분 전 │  ← 이미지는 작은 썸네일
 //! │ ❷  https://…              chrome · 3분 전 │  ← ❶❷ = 여러 개 고른 순서 표시
 //! │ ❶  안녕하세요               카톡 · 5분 전 │
-//! │  (F2 로 미리보기 켜기)                    │
 //! │  2개 선택됨 · Enter 한 번에 붙여넣기      │  ← 한 줄 도움말
 //! └──────────────────────────────────────┘
 
+use std::collections::HashMap;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use clipstash::config::{PopupPosition, Theme};
 use clipstash::history::{relative_time, ClipContent, View};
-use clipstash::search::Query;
 use clipstash::transform::Transform;
 use clipstash::{bmp, storage};
 
@@ -32,7 +32,6 @@ use super::{app, Action, App};
 
 const POPUP_CLASS: &str = "ClipStash.Popup";
 const PREVIEW_CLASS: &str = "ClipStash.Preview";
-const ID_EDIT: usize = 10;
 const ID_LIST: usize = 11;
 
 const MAX_ROWS: usize = 2000;
@@ -127,7 +126,6 @@ pub struct Row {
 
 pub struct Popup {
     pub hwnd: HWND,
-    edit: HWND,
     list: HWND,
     preview: HWND,
     font: HFONT,
@@ -149,13 +147,14 @@ pub struct Popup {
     pub target: HWND,
     show_preview: bool,
     image_cache: Option<(u64, Vec<u8>)>,
+    /// 목록에 그릴 작은 이미지(항목 id → 비트맵, 가로, 세로)
+    thumbs: HashMap<u64, (HBITMAP, i32, i32)>,
 }
 
 impl Default for Popup {
     fn default() -> Self {
         Popup {
             hwnd: null_mut(),
-            edit: null_mut(),
             list: null_mut(),
             preview: null_mut(),
             font: null_mut(),
@@ -176,6 +175,7 @@ impl Default for Popup {
             target: null_mut(),
             show_preview: false,
             image_cache: None,
+            thumbs: HashMap::new(),
         }
     }
 }
@@ -196,15 +196,6 @@ impl Popup {
 
     fn selected(&self) -> Option<RowRef> {
         self.selected_index().map(|i| self.rows[i].r)
-    }
-
-    fn search_text(&self) -> String {
-        unsafe {
-            let len = GetWindowTextLengthW(self.edit);
-            let mut buf = vec![0u16; len as usize + 1];
-            GetWindowTextW(self.edit, buf.as_mut_ptr(), buf.len() as i32);
-            util::from_wide(&buf)
-        }
     }
 
     fn mark_order(&self, id: u64) -> Option<usize> {
@@ -237,9 +228,7 @@ pub fn register_classes(hinst: HINSTANCE) {
     }
 }
 
-static EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
-/// 처리한 키(Ctrl+Space 등)가 만드는 글자를 검색창에 넣지 않기 위한 표시
-static SWALLOW_CHAR: AtomicBool = AtomicBool::new(false);
+static LIST_PROC: AtomicIsize = AtomicIsize::new(0);
 
 pub fn create(a: &mut App) {
     unsafe {
@@ -259,26 +248,6 @@ pub fn create(a: &mut App) {
             a.hinst,
             null(),
         );
-        let edit_cls = wide("EDIT");
-        let edit = CreateWindowExW(
-            0,
-            edit_cls.as_ptr(),
-            null(),
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-            0,
-            0,
-            10,
-            10,
-            hwnd,
-            ID_EDIT as HMENU,
-            a.hinst,
-            null(),
-        );
-        let cue = wide("검색  (초성 OK: ㅎㄱ → 한국)");
-        SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
-        let old = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
-        EDIT_PROC.store(old, Ordering::Relaxed);
-
         let lb_cls = wide("LISTBOX");
         let list = CreateWindowExW(
             0,
@@ -287,7 +256,7 @@ pub fn create(a: &mut App) {
             WS_CHILD
                 | WS_VISIBLE
                 | WS_VSCROLL
-                | (LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_NODATA | LBS_NOINTEGRALHEIGHT) as u32,
+                | (LBS_NOTIFY | LBS_OWNERDRAWVARIABLE | LBS_NOINTEGRALHEIGHT) as u32,
             0,
             0,
             10,
@@ -297,6 +266,9 @@ pub fn create(a: &mut App) {
             a.hinst,
             null(),
         );
+        // 키 입력은 목록이 직접 받습니다(검색창 없음).
+        let old = SetWindowLongPtrW(list, GWLP_WNDPROC, list_proc as *const () as isize);
+        LIST_PROC.store(old, Ordering::Relaxed);
         let pv_cls = wide(PREVIEW_CLASS);
         let preview = CreateWindowExW(
             0,
@@ -314,7 +286,6 @@ pub fn create(a: &mut App) {
         );
         let p = &mut a.popup;
         p.hwnd = hwnd;
-        p.edit = edit;
         p.list = list;
         p.preview = preview;
         // Windows 11: 둥근 모서리
@@ -387,12 +358,23 @@ fn text_height(hwnd: HWND, font: HFONT) -> i32 {
 }
 
 fn row_height(p: &Popup) -> i32 {
-    p.font_h + p.scale(16)
+    p.font_h + p.scale(14)
 }
+
+/// 이미지 항목 줄 높이(썸네일이 들어갈 만큼)
+fn image_row_height(p: &Popup) -> i32 {
+    row_height(p).max(THUMB_H * p.dpi as i32 / 96 + p.scale(10))
+}
+
+const THUMB_W: i32 = 64;
+const THUMB_H: i32 = 44;
 
 /// DPI(또는 글꼴 설정)가 바뀌면 글꼴을 다시 만듭니다.
 fn set_dpi(a: &mut App, dpi: u32) {
     let p = &mut a.popup;
+    if p.dpi != dpi {
+        clear_thumbs(p);
+    }
     p.dpi = dpi;
     unsafe {
         for f in [p.font, p.font_bold, p.font_small] {
@@ -407,29 +389,8 @@ fn set_dpi(a: &mut App, dpi: u32) {
     p.font_small = make_font(&a.config.font_name, size.saturating_sub(1).max(6), dpi, false);
     p.font_h = text_height(p.hwnd, p.font);
     p.small_h = text_height(p.hwnd, p.font_small);
-    p.header_h = p.font_h + p.scale(28);
+    p.header_h = p.font_h + p.scale(20);
     p.footer_h = p.small_h + p.scale(14);
-    unsafe {
-        SendMessageW(p.edit, WM_SETFONT, p.font as WPARAM, 1);
-        SendMessageW(p.list, LB_SETITEMHEIGHT, 0, row_height(p) as LPARAM);
-    }
-}
-
-/// 탭 글자 영역의 너비(오른쪽 위)
-fn tabs_width(p: &Popup) -> i32 {
-    unsafe {
-        let dc = GetDC(p.hwnd);
-        let w: i32 = Tab::ALL.iter().map(|t| text_width(dc, t.name(), p.font_bold) + p.scale(14)).sum();
-        ReleaseDC(p.hwnd, dc);
-        w + p.scale(6)
-    }
-}
-
-/// 검색창 배경 상자(둥근 사각형)
-fn search_box(p: &Popup, client_w: i32) -> RECT {
-    let pad = p.scale(10);
-    let top = p.scale(10);
-    RECT { left: pad, top, right: client_w - pad - tabs_width(p), bottom: p.header_h - p.scale(6) }
 }
 
 fn layout(p: &mut Popup) {
@@ -437,13 +398,7 @@ fn layout(p: &mut Popup) {
         let mut rc: RECT = std::mem::zeroed();
         GetClientRect(p.hwnd, &mut rc);
         let (w, h) = (rc.right, rc.bottom);
-        let sb = search_box(p, w);
-        let inset = p.scale(10);
-        let edit_h = p.font_h + p.scale(2);
-        let edit_y = sb.top + (sb.bottom - sb.top - edit_h) / 2;
-        MoveWindow(p.edit, sb.left + inset, edit_y, sb.right - sb.left - 2 * inset, edit_h, 1);
-
-        let list_y = p.header_h + p.scale(4);
+        let list_y = p.header_h;
         let avail = h - list_y - p.footer_h;
         let preview_h = if p.show_preview { (avail * 32 / 100).max(p.font_h * 4) } else { 0 };
         let list_h = avail - preview_h;
@@ -510,14 +465,13 @@ pub fn show(a: &mut App, target: HWND, at_mouse: bool) {
         p.show_preview = a.config.show_preview;
         ShowWindow(p.preview, if p.show_preview { SW_SHOWNA } else { SW_HIDE });
         layout(p);
-        let empty = wide("");
-        SetWindowTextW(p.edit, empty.as_ptr()); // EN_CHANGE → refresh
+        p.rows.clear();
         refresh(a);
         select(&a.popup, 0);
         let p = &mut a.popup;
         ShowWindow(p.hwnd, SW_SHOW);
         SetForegroundWindow(p.hwnd);
-        SetFocus(p.edit);
+        SetFocus(p.list);
     }
 }
 
@@ -551,13 +505,12 @@ fn caret_point(target: HWND) -> Option<(POINT, i32)> {
 
 /// 현재 탭/검색어로 목록을 다시 만듭니다. 선택은 가능하면 같은 항목에 유지합니다.
 pub fn refresh(a: &mut App) {
-    let query = a.popup.search_text();
     let now = util::now_unix();
     let rows: Vec<Row> = match a.popup.tab {
         Tab::History | Tab::Pinned => {
             let view = if a.popup.tab == Tab::Pinned { View::Pinned } else { View::All };
             a.history
-                .filter(&query, view)
+                .filter("", view)
                 .into_iter()
                 .take(MAX_ROWS)
                 .map(|i| {
@@ -580,12 +533,10 @@ pub fn refresh(a: &mut App) {
                 .collect()
         }
         Tab::Templates => {
-            let q = Query::new(&query);
             a.config
                 .templates
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| q.matches(&format!("{} {} {}", t.name, t.group.as_deref().unwrap_or(""), t.text)))
                 .map(|(idx, t)| Row {
                     r: RowRef::Template(idx),
                     title: t.name.clone(),
@@ -599,12 +550,24 @@ pub fn refresh(a: &mut App) {
     // 지워진 항목은 선택 목록에서도 뺍니다.
     let history = &a.history;
     a.popup.marks.retain(|id| history.get(*id).is_some());
+    // 지워진 이미지의 썸네일도 정리
+    let gone: Vec<u64> = a.popup.thumbs.keys().copied().filter(|id| history.get(*id).is_none()).collect();
+    for id in gone {
+        if let Some((bmp, _, _)) = a.popup.thumbs.remove(&id) {
+            unsafe { DeleteObject(bmp as HGDIOBJ) };
+        }
+    }
     let p = &mut a.popup;
     let prev = p.selected();
     p.rows = rows;
     unsafe {
         SendMessageW(p.list, WM_SETREDRAW, 0, 0);
-        SendMessageW(p.list, LB_SETCOUNT, p.rows.len(), 0);
+        SendMessageW(p.list, LB_RESETCONTENT, 0, 0);
+        SendMessageW(p.list, LB_INITSTORAGE, p.rows.len(), 0);
+        for i in 0..p.rows.len() {
+            // 그리기는 직접 하므로 항목 데이터로 번호만 넣습니다(WM_MEASUREITEM 이 줄 높이를 정함)
+            SendMessageW(p.list, LB_ADDSTRING, 0, i as LPARAM);
+        }
         if !p.rows.is_empty() {
             let keep = prev.and_then(|r| p.rows.iter().position(|row| row.r == r)).unwrap_or(0);
             SendMessageW(p.list, LB_SETCURSEL, keep, 0);
@@ -650,17 +613,9 @@ fn move_selection(p: &Popup, delta: isize) {
     select(p, cur + delta);
 }
 
-fn page_rows(p: &Popup) -> isize {
-    unsafe {
-        let mut rc: RECT = std::mem::zeroed();
-        GetClientRect(p.list, &mut rc);
-        let row_h = SendMessageW(p.list, LB_GETITEMHEIGHT, 0, 0).max(1);
-        ((rc.bottom as isize) / row_h).max(1)
-    }
-}
-
 fn switch_tab(a: &mut App, tab: Tab) {
     a.popup.tab = tab;
+    a.popup.marks.clear();
     a.popup.rows.clear();
     unsafe { SendMessageW(a.popup.list, LB_SETCURSEL, usize::MAX, 0) };
     refresh(a);
@@ -850,31 +805,15 @@ fn key_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetKeyState(vk as i32) < 0 }
 }
 
-fn clear_search(edit: HWND) {
-    let e = wide("");
-    unsafe { SetWindowTextW(edit, e.as_ptr()) };
-}
-
-/// 검색창의 키 입력을 가로채서 목록 조작에 씁니다. 처리했으면 true.
-fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
+/// 목록의 키 입력. 처리했으면 true(처리하지 않은 ↑↓ PgUp/PgDn Home/End 는 목록이 알아서 움직임).
+fn handle_key(a: &mut App, vk: VIRTUAL_KEY) -> bool {
     let ctrl = key_down(VK_CONTROL);
     let shift = key_down(VK_SHIFT);
     let paste = if shift { Action::PastePlain } else { Action::Paste };
     match vk {
         VK_UP if shift => extend_marks(&mut a.popup, -1),
         VK_DOWN if shift => extend_marks(&mut a.popup, 1),
-        VK_UP => move_selection(&a.popup, -1),
-        VK_DOWN => move_selection(&a.popup, 1),
-        VK_PRIOR => move_selection(&a.popup, -page_rows(&a.popup)),
-        VK_NEXT => move_selection(&a.popup, page_rows(&a.popup)),
-        VK_HOME if ctrl => select(&a.popup, 0),
-        VK_END if ctrl => select(&a.popup, isize::MAX),
-        VK_SPACE if ctrl => {
-            SWALLOW_CHAR.store(true, Ordering::Relaxed);
-            toggle_mark(&mut a.popup);
-            move_selection(&a.popup, 1);
-        }
-        VK_INSERT => {
+        VK_SPACE | VK_INSERT => {
             toggle_mark(&mut a.popup);
             move_selection(&a.popup, 1);
         }
@@ -886,10 +825,8 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
             if !a.popup.marks.is_empty() {
                 a.popup.marks.clear();
                 redraw(&a.popup);
-            } else if a.popup.search_text().is_empty() {
-                hide(a);
             } else {
-                clear_search(edit);
+                hide(a);
             }
         }
         VK_TAB => {
@@ -897,10 +834,18 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
             switch_tab(a, Tab::ALL[i.rem_euclid(3) as usize]);
         }
         VK_F2 => toggle_preview(a),
-        VK_DELETE if shift || a.popup.search_text().is_empty() => delete_selected(a),
+        VK_DELETE => delete_selected(a),
         VK_APPS => context_menu_at_selection(a),
         VK_F10 if shift => context_menu_at_selection(a),
-        VK_BACK if ctrl => clear_search(edit),
+        // 숫자 키 1~9, 0(=10번째): 바로 붙여넣기 (Ctrl 과 함께 눌러도 됨)
+        k @ (0x30..=0x39 | VK_NUMPAD0..=VK_NUMPAD9) => {
+            let d = if k >= VK_NUMPAD0 { k - VK_NUMPAD0 } else { k - 0x30 } as usize;
+            let idx = if d == 0 { 9 } else { d - 1 };
+            if let Some(row) = a.popup.rows.get(idx).map(|r| r.r) {
+                a.popup.marks.clear();
+                activate(a, Some(row), paste);
+            }
+        }
         _ if ctrl => match vk as u8 {
             b'P' => {
                 if let Some(RowRef::Clip(id)) = a.popup.selected() {
@@ -916,28 +861,9 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
                 hide(a);
                 a.open_config_file();
             }
-            b'A' => unsafe {
-                SendMessageW(edit, EM_SETSEL, 0, -1);
-            },
             b'C' => {
-                let (mut s, mut e) = (0u32, 0u32);
-                unsafe {
-                    SendMessageW(edit, EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM)
-                };
-                if s != e {
-                    return false; // 검색어를 선택했으면 평범한 복사
-                }
                 let row = a.popup.selected();
                 activate(a, row, Action::CopyOnly);
-            }
-            d @ b'0'..=b'9' => {
-                // Ctrl+1 … Ctrl+9, Ctrl+0 = 10번째
-                let idx = if d == b'0' { 9 } else { (d - b'1') as usize };
-                let row = a.popup.rows.get(idx).map(|r| r.r);
-                if let Some(row) = row {
-                    a.popup.marks.clear();
-                    activate(a, Some(row), paste);
-                }
             }
             _ => return false,
         },
@@ -946,27 +872,20 @@ fn handle_key(a: &mut App, edit: HWND, vk: VIRTUAL_KEY) -> bool {
     true
 }
 
-unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_KEYDOWN => {
-            if handle_key(app(), hwnd, wp as VIRTUAL_KEY) {
+            if handle_key(app(), wp as VIRTUAL_KEY) {
                 return 0;
             }
         }
-        WM_CHAR => {
-            if SWALLOW_CHAR.swap(false, Ordering::Relaxed) {
-                return 0;
-            }
-            // 위에서 처리한 키(Enter, Esc, Tab, Ctrl+문자)가 삑 소리나 이상한 글자를 내지 않도록.
-            // Ctrl+V(0x16)/X(0x18)/Z(0x1A) 는 검색창 편집에 쓰므로 통과.
-            let c = wp as u32;
-            if (c < 0x20 && !matches!(c, 0x08 | 0x16 | 0x18 | 0x1A)) || c == 0x7F {
-                return 0;
-            }
-        }
+        // 글자 입력은 쓰지 않습니다(삑 소리 방지)
+        WM_CHAR => return 0,
+        // Tab/Enter/Esc 등 모든 키를 목록이 직접 받도록
+        WM_GETDLGCODE => return DLGC_WANTALLKEYS as LRESULT,
         _ => {}
     }
-    let old: WNDPROC = std::mem::transmute(EDIT_PROC.load(Ordering::Relaxed));
+    let old: WNDPROC = std::mem::transmute(LIST_PROC.load(Ordering::Relaxed));
     CallWindowProcW(old, hwnd, msg, wp, lp)
 }
 
@@ -987,17 +906,13 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let id = wp & 0xFFFF;
             let code = ((wp >> 16) & 0xFFFF) as u32;
             match (id, code) {
-                (ID_EDIT, EN_CHANGE) => {
-                    refresh(a);
-                    select(&a.popup, 0);
-                }
                 (ID_LIST, LBN_SELCHANGE) => {
                     // Ctrl+클릭 = 여러 개 선택에 넣기/빼기
-                    if key_down(VK_CONTROL) {
+                    if key_down(VK_CONTROL) && key_down(VK_LBUTTON) {
                         toggle_mark(&mut a.popup);
                     }
                     InvalidateRect(a.popup.preview, null(), 1);
-                    SetFocus(a.popup.edit);
+                    InvalidateRect(a.popup.hwnd, null(), 0);
                 }
                 (ID_LIST, LBN_DBLCLK) => {
                     let row = a.popup.selected();
@@ -1021,7 +936,6 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                         select(&a.popup, r & 0xFFFF);
                         context_menu(a, pt);
                     }
-                    SetFocus(a.popup.edit);
                 }
             }
             0
@@ -1031,12 +945,17 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             if let Some(i) = a.popup.tab_rects.iter().position(|r| PtInRect(r, pt) != 0) {
                 switch_tab(a, Tab::ALL[i]);
             }
-            SetFocus(a.popup.edit);
+            SetFocus(a.popup.list);
             0
         }
         WM_MEASUREITEM => {
             let mis = &mut *(lp as *mut MEASUREITEMSTRUCT);
-            mis.itemHeight = row_height(&a.popup) as u32;
+            let p = &a.popup;
+            let is_image = match p.rows.get(mis.itemID as usize).map(|r| r.r) {
+                Some(RowRef::Clip(id)) => matches!(a.history.get(id).map(|i| &i.content), Some(ClipContent::Image { .. })),
+                _ => false,
+            };
+            mis.itemHeight = if is_image { image_row_height(p) } else { row_height(p) } as u32;
             1
         }
         WM_DRAWITEM => {
@@ -1058,12 +977,6 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_SIZE => {
             layout(&mut a.popup);
             0
-        }
-        WM_CTLCOLOREDIT => {
-            let dc = wp as HDC;
-            SetBkColor(dc, a.popup.pal.surface);
-            SetTextColor(dc, a.popup.pal.text);
-            a.popup.surface_brush as LRESULT
         }
         WM_CTLCOLORLISTBOX => a.popup.bg_brush as LRESULT,
         WM_CLOSE => {
@@ -1110,7 +1023,7 @@ unsafe fn text_width(dc: HDC, s: &str, font: HFONT) -> i32 {
     rc.right
 }
 
-/// 검색창 상자, 탭, (비어 있을 때) 안내 문구, 아래쪽 한 줄 도움말을 그립니다.
+/// 탭, (비어 있을 때) 안내 문구, 아래쪽 한 줄 도움말을 그립니다.
 unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut ps);
@@ -1120,12 +1033,9 @@ unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
     GetClientRect(hwnd, &mut rc);
     fill(dc, &rc, pal.bg);
 
-    // 검색창 상자
-    let sb = search_box(p, rc.right);
-    fill_round(dc, &sb, p.scale(12), pal.surface);
-
-    // 탭(오른쪽 위, 글자만)
-    let mut x = sb.right + p.scale(6);
+    // 탭(위쪽, 글자만)
+    let sb = RECT { left: 0, top: p.scale(4), right: 0, bottom: p.header_h - p.scale(4) };
+    let mut x = p.scale(12);
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let sel = *tab == p.tab;
         let font = if sel { p.font_bold } else { p.font };
@@ -1146,7 +1056,6 @@ unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
         let msg = match p.tab {
             Tab::Pinned => "고정한 항목이 없어요\n기록에서 Ctrl+P 로 고정하세요",
             Tab::Templates => "템플릿이 없어요\nCtrl+E 로 설정 파일에서 추가하세요",
-            Tab::History if !p.search_text().is_empty() => "검색 결과가 없어요",
             Tab::History => "아직 기록이 없어요\n아무 글이나 복사(Ctrl+C)해 보세요",
         };
         let mut r = RECT { left: 0, top: p.header_h + p.scale(40), right: rc.right, bottom: rc.bottom - p.footer_h };
@@ -1159,8 +1068,8 @@ unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
         (format!("{}개 선택됨  ·  Enter 한 번에 붙여넣기  ·  Esc 선택 해제", n), pal.accent)
     } else {
         let h = match p.tab {
-            Tab::Templates => "Enter 붙여넣기  ·  Tab 전환  ·  Ctrl+E 편집",
-            _ => "Enter 붙여넣기  ·  Ctrl+Space 여러 개  ·  Tab 전환  ·  F2 미리보기",
+            Tab::Templates => "1~9 · Enter 붙여넣기  ·  Tab 전환  ·  Ctrl+E 편집",
+            _ => "1~9 바로 붙여넣기  ·  Space 여러 개 선택  ·  Tab 전환  ·  F2 미리보기",
         };
         (h.to_string(), pal.muted)
     };
@@ -1179,7 +1088,80 @@ unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
     EndPaint(hwnd, &ps);
 }
 
-unsafe fn draw_row(a: &App, dis: &DRAWITEMSTRUCT) {
+fn clear_thumbs(p: &mut Popup) {
+    for (_, (bmp, _, _)) in p.thumbs.drain() {
+        unsafe { DeleteObject(bmp as HGDIOBJ) };
+    }
+}
+
+/// DIB 를 작은 비트맵으로 줄여 만듭니다.
+unsafe fn make_thumb(dib: &[u8], max_w: i32, max_h: i32) -> Option<(HBITMAP, i32, i32)> {
+    let (w, h) = bmp::dib_size(dib)?;
+    let off = bmp::pixel_offset(dib)? as usize;
+    if w == 0 || h == 0 || off >= dib.len() {
+        return None;
+    }
+    let s = (max_w as f64 / w as f64).min(max_h as f64 / h as f64).min(1.0);
+    let tw = ((w as f64 * s) as i32).max(1);
+    let th = ((h as f64 * s) as i32).max(1);
+    let screen = GetDC(null_mut());
+    let mem = CreateCompatibleDC(screen);
+    let bmp = CreateCompatibleBitmap(screen, tw, th);
+    let old = SelectObject(mem, bmp as HGDIOBJ);
+    SetStretchBltMode(mem, HALFTONE);
+    SetBrushOrgEx(mem, 0, 0, null_mut());
+    StretchDIBits(
+        mem,
+        0,
+        0,
+        tw,
+        th,
+        0,
+        0,
+        w as i32,
+        h as i32,
+        dib.as_ptr().add(off) as *const _,
+        dib.as_ptr() as *const BITMAPINFO,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    ReleaseDC(null_mut(), screen);
+    Some((bmp, tw, th))
+}
+
+/// 새로 복사한 이미지의 썸네일을 미리 만들어 둡니다(팝업을 열 때 파일을 읽지 않도록).
+pub fn cache_thumbnail(a: &mut App, id: u64, dib: &[u8]) {
+    let p = &mut a.popup;
+    if p.thumbs.contains_key(&id) || p.dpi == 0 {
+        return;
+    }
+    let (mw, mh) = (THUMB_W * p.dpi as i32 / 96, THUMB_H * p.dpi as i32 / 96);
+    if let Some(t) = unsafe { make_thumb(dib, mw, mh) } {
+        p.thumbs.insert(id, t);
+    }
+}
+
+/// 이미지 항목의 썸네일(없으면 파일에서 읽어 만들고 기억해 둠). 이미지가 아니면 None.
+unsafe fn thumbnail(a: &mut App, id: u64) -> Option<(HBITMAP, i32, i32)> {
+    let ClipContent::Image { file, .. } = &a.history.get(id)?.content else { return None };
+    if let Some(t) = a.popup.thumbs.get(&id) {
+        return Some(*t);
+    }
+    let data = std::fs::read(storage::image_path(&a.data_dir, file)).ok()?;
+    let dib = bmp::bmp_to_dib(&data)?;
+    let dpi = a.popup.dpi as i32;
+    let t = make_thumb(dib, THUMB_W * dpi / 96, THUMB_H * dpi / 96)?;
+    a.popup.thumbs.insert(id, t);
+    Some(t)
+}
+
+unsafe fn draw_row(a: &mut App, dis: &DRAWITEMSTRUCT) {
+    let thumb = match a.popup.rows.get(dis.itemID as usize).map(|r| r.r) {
+        Some(RowRef::Clip(id)) => thumbnail(a, id),
+        _ => None,
+    };
     let p = &a.popup;
     let pal = p.pal;
     let dc = dis.hDC;
@@ -1214,6 +1196,24 @@ unsafe fn draw_row(a: &App, dis: &DRAWITEMSTRUCT) {
         draw_text(dc, &(dis.itemID + 1).to_string(), &mut r, pal.muted, p.font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     x += badge + p.scale(10);
+
+    // 이미지면 작은 썸네일
+    {
+        if let Some((bmp, tw, th)) = thumb {
+            let box_w = THUMB_W * p.dpi as i32 / 96;
+            let ty = cy - th / 2;
+            let mem = CreateCompatibleDC(dc);
+            let old = SelectObject(mem, bmp as HGDIOBJ);
+            BitBlt(dc, x, ty, tw, th, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+            let frame = RECT { left: x - 1, top: ty - 1, right: x + tw + 1, bottom: ty + th + 1 };
+            let b = CreateSolidBrush(pal.line);
+            FrameRect(dc, &frame, b);
+            DeleteObject(b as HGDIOBJ);
+            x += box_w + p.scale(10);
+        }
+    }
 
     // 오른쪽 정보(프로그램 · 시간)
     let meta_w = text_width(dc, &row.meta, p.font_small).min((rc.right - rc.left) / 3);

@@ -436,6 +436,7 @@ impl App {
             clip::ReadResult::Got(c) => c,
             _ => return,
         };
+        let mut captured_dib = None;
         let (content, h) = match captured {
             clip::Captured::Text { text, html } => {
                 if text.is_empty() || (self.config.ignore_whitespace_only && text.trim().is_empty()) {
@@ -459,10 +460,14 @@ impl App {
                         return;
                     }
                 }
+                captured_dib = Some(dib);
                 (ClipContent::Image { file, width, height }, h)
             }
         };
         let out = self.history.add(content, h, source, util::now_unix(), self.config.max_items);
+        if let Some(dib) = captured_dib {
+            popup::cache_thumbnail(self, out.id, &dib);
+        }
         storage::delete_item_files(&self.data_dir, &out.evicted);
         self.mark_dirty();
         popup::on_history_changed(self);
