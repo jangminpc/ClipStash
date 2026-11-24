@@ -77,7 +77,7 @@ impl Default for Config {
             ignore_whitespace_only: true,
             popup_position: PopupPosition::Caret,
             theme: Theme::Dark,
-            popup_opacity: 94,
+            popup_opacity: 80,
             show_preview: false,
             merge_separator: "\n".into(),
             popup_width: 440,
@@ -243,7 +243,7 @@ popup_height = 480
 # 팝업 모양: "dark"(어두운 테마) 또는 "light"(밝은 테마)
 theme = "dark"
 # 팝업 불투명도(%). 100 이면 투명하지 않음, 낮을수록 뒤가 비침(50~100)
-popup_opacity = 94
+popup_opacity = 80
 # 아래쪽 미리보기 칸을 처음부터 보이기(팝업에서 F3 으로 켜고 끌 수 있음)
 show_preview = false
 
