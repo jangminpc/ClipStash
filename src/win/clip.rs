@@ -81,7 +81,7 @@ unsafe fn get_bytes(fmt: u32) -> Option<Vec<u8>> {
 }
 
 fn utf16_le_to_string(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
     String::from_utf16_lossy(&units[..len])
 }
