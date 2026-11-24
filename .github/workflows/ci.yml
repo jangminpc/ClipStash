@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-core:
+    name: 핵심 로직 테스트 (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib
+
+  build-windows:
+    name: Windows 빌드 + 실행 확인
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: 테스트
+        run: cargo test --lib
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+      - name: 릴리스 빌드
+        run: cargo build --release
+
+      - name: 실행 확인 (복사한 글이 기록되는지)
+        shell: pwsh
+        run: |
+          $dir = "target\release"
+          New-Item -ItemType Directory -Force -Path "$dir\data" | Out-Null   # 휴대용 모드
+          $p = Start-Process "$dir\clipstash.exe" -PassThru
+          Start-Sleep -Seconds 3
+          if ($p.HasExited) { throw "프로그램이 바로 종료되었습니다 (exit $($p.ExitCode))" }
+          if (-not (Test-Path "$dir\data\config.toml")) { throw "config.toml 이 만들어지지 않았습니다" }
+
+          $marker = "ClipStash smoke test 한글 $(Get-Random)"
+          Set-Clipboard -Value $marker
+          Start-Sleep -Seconds 4   # 저장은 1.5초 뒤에 한꺼번에
+          $json = Get-Content "$dir\data\history.json" -Raw -Encoding utf8
+          if ($json -notlike "*$marker*") { throw "복사한 글이 history.json 에 기록되지 않았습니다:`n$json" }
+          Write-Host "기록 확인: $marker"
+
+          # 두 번째 실행은 기존 프로그램에 신호만 보내고 바로 끝나야 합니다.
+          $p2 = Start-Process "$dir\clipstash.exe" -PassThru
+          if (-not $p2.WaitForExit(5000)) { throw "두 번째 실행이 끝나지 않았습니다(중복 실행 방지 실패)" }
+
+          Stop-Process -Id $p.Id -Force
+          Write-Host "OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipstash-windows-x64
+          path: target/release/clipstash.exe

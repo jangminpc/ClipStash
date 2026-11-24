@@ -1,0 +1,30 @@
+#pragma code_page(65001)
+#include <winres.h>
+
+1 ICON "app.ico"
+2 ICON "paused.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEOS 0x40004
+ FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "041204B0"
+    BEGIN
+      VALUE "CompanyName", "ClipStash"
+      VALUE "FileDescription", "ClipStash 클립보드 기록 관리자"
+      VALUE "FileVersion", "0.1.0"
+      VALUE "ProductName", "ClipStash"
+      VALUE "ProductVersion", "0.1.0"
+      VALUE "OriginalFilename", "clipstash.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x412, 1200
+  END
+END
