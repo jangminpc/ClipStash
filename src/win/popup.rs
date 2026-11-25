@@ -208,6 +208,15 @@ impl Popup {
         v * self.dpi as i32 / 96
     }
 
+    /// 줄 왼쪽 배치: (체크박스 왼쪽, 체크박스 오른쪽, 번호 왼쪽, 내용 왼쪽)
+    fn lead_x(&self) -> (i32, i32, i32, i32) {
+        let check_l = self.scale(10);
+        let check_r = check_l + self.scale(18);
+        let num_l = check_r + self.scale(4);
+        let content_l = num_l + self.scale(16) + self.scale(8);
+        (check_l, check_r, num_l, content_l)
+    }
+
     fn selected_index(&self) -> Option<usize> {
         let i = unsafe { SendMessageW(self.list, LB_GETCURSEL, 0, 0) };
         (i >= 0 && (i as usize) < self.rows.len()).then_some(i as usize)
@@ -1316,16 +1325,26 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 return 0;
             }
         }
-        // 썸네일을 누르면 크게 보기
-        WM_LBUTTONDOWN if !key_down(VK_CONTROL) && !key_down(VK_SHIFT) => {
+        // 체크박스를 누르면 체크/해제(체크한 순서대로 번호가 붙음)
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if !key_down(VK_CONTROL) && !key_down(VK_SHIFT) => {
             let a = app();
             let r = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lp);
             if (r >> 16) & 0xFFFF == 0 {
                 let idx = (r & 0xFFFF) as usize;
-                if let Some(RowRef::Clip(id)) = a.popup.rows.get(idx).map(|row| row.r) {
-                    let x = (lp & 0xFFFF) as i16 as i32;
+                let x = (lp & 0xFFFF) as i16 as i32;
+                let (_, check_r, _, content_l) = a.popup.lead_x();
+                if let Some(RowRef::Clip(_)) = a.popup.rows.get(idx).map(|row| row.r) {
+                    if x < check_r + a.popup.scale(3) {
+                        select(&a.popup, idx as isize);
+                        SetFocus(hwnd);
+                        toggle_mark(&mut a.popup);
+                        return 0;
+                    }
+                }
+                // 썸네일을 누르면 크게 보기
+                if let (WM_LBUTTONDOWN, Some(RowRef::Clip(id))) = (msg, a.popup.rows.get(idx).map(|row| row.r)) {
                     let p = &a.popup;
-                    let x0 = p.scale(12) + p.scale(20) + p.scale(10);
+                    let x0 = content_l;
                     let x1 = x0 + THUMB_W * p.dpi as i32 / 96;
                     let is_image = matches!(a.history.get(id).map(|i| &i.content), Some(ClipContent::Image { .. }));
                     if is_image && x >= x0 && x <= x1 {
@@ -1570,7 +1589,7 @@ unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
         let h = match p.tab {
             Tab::Templates => "1~9 · Enter 붙여넣기  ·  F2 고쳐서 붙여넣기  ·  Ctrl+E 편집",
             _ if selected_is_image => "Enter 붙여넣기  ·  V 크게 보기  ·  O 글자 추출  ·  우클릭 메뉴",
-            _ => "1~9 붙여넣기  ·  Space 여러 개  ·  F2 고쳐서  ·  우클릭 메뉴",
+            _ => "1~9 붙여넣기  ·  체크(Space)한 순서대로 합치기  ·  F2 고쳐서",
         };
         (h.to_string(), pal.muted)
     };
@@ -1681,22 +1700,32 @@ unsafe fn draw_row(a: &mut App, dis: &DRAWITEMSTRUCT) {
         let r = RECT { left: rc.left + p.scale(4), top: rc.top + p.scale(1), right: rc.right - p.scale(4), bottom: rc.bottom - p.scale(1) };
         fill_round(dc, &r, p.scale(10), pal.sel);
     }
-    let pad = p.scale(12);
-    let mut x = rc.left + pad;
-
-    // 왼쪽: 여러 개 선택 순서(동그라미) 또는 번호(Ctrl+1~9)
-    let badge = p.scale(20);
+    let (check_l, check_r, num_l, content_l) = p.lead_x();
     let cy = (rc.top + rc.bottom) / 2;
-    if let Some(order) = mark {
-        let br = RECT { left: x, top: cy - badge / 2, right: x + badge, bottom: cy + badge / 2 };
-        fill_round(dc, &br, badge, pal.accent);
-        let mut tr = br;
-        draw_text(dc, &(order + 1).to_string(), &mut tr, pal.on_accent, p.font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    } else if dis.itemID < 9 {
-        let mut r = RECT { left: x, top: rc.top, right: x + badge, bottom: rc.bottom };
+
+    // 맨 왼쪽: 체크박스(체크하면 체크한 순서 번호)
+    if let RowRef::Clip(_) = row.r {
+        let half = (check_r - check_l) / 2;
+        let br = RECT { left: rc.left + check_l, top: cy - half, right: rc.left + check_r, bottom: cy + half };
+        let radius = p.scale(6);
+        if let Some(order) = mark {
+            fill_round(dc, &br, radius, pal.accent);
+            let mut tr = br;
+            draw_text(dc, &(order + 1).to_string(), &mut tr, pal.on_accent, p.font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            fill_round(dc, &br, radius, pal.muted);
+            let t = p.scale(2).max(1);
+            let ir = RECT { left: br.left + t, top: br.top + t, right: br.right - t, bottom: br.bottom - t };
+            fill_round(dc, &ir, (radius - t).max(1), if selected { pal.sel } else { pal.bg });
+        }
+    }
+    // 그 옆: 번호(1~9 바로 붙여넣기)
+    if dis.itemID < 9 {
+        let mut r = RECT { left: rc.left + num_l, top: rc.top, right: rc.left + num_l + p.scale(16), bottom: rc.bottom };
         draw_text(dc, &(dis.itemID + 1).to_string(), &mut r, pal.muted, p.font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
-    x += badge + p.scale(10);
+    let mut x = rc.left + content_l;
+    let pad = p.scale(12);
 
     // 이미지면 작은 썸네일
     {
@@ -1771,7 +1800,7 @@ unsafe fn paint_preview(a: &mut App, dc: HDC, rc: RECT) {
         let merged = a.history.merge_text(&p.marks, &a.config.merge_separator).unwrap_or_default();
         inner.bottom -= info_h;
         draw_text(dc, &merged.chars().take(4000).collect::<String>(), &mut inner, pal.text, font, text_flags);
-        let info = format!("{}개를 복사한 순서대로 이어 붙입니다", p.marks.len());
+        let info = format!("{}개를 체크한 순서대로 이어 붙입니다", p.marks.len());
         draw_text(dc, &info, &mut info_r, pal.accent, font, DT_SINGLELINE | DT_END_ELLIPSIS);
         return;
     }

@@ -959,7 +959,7 @@ impl App {
         self.finish_paste(action == Action::CopyOnly, None);
     }
 
-    /// 여러 항목을 복사한 순서대로 이어 붙여서 한 번에 붙여넣기
+    /// 여러 항목을 체크한 순서대로 이어 붙여서 한 번에 붙여넣기
     pub fn use_many(&mut self, ids: &[u64], action: Action) {
         let Some(mut text) = self.history.merge_text(ids, &self.config.merge_separator) else {
             popup::hide(self);
