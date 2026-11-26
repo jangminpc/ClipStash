@@ -629,6 +629,8 @@ pub fn refresh(a: &mut App) {
         Tab::History | Tab::Pinned => {
             let view = if a.popup.tab == Tab::Pinned { View::Pinned } else { View::All };
             let filter = a.popup.app_filter.clone();
+            // 기록 탭은 최근 popup_rows 개만(고정 탭은 전부)
+            let limit = if a.popup.tab == Tab::Pinned { MAX_ROWS } else { a.config.popup_rows.min(MAX_ROWS) };
             a.history
                 .filter("", view)
                 .into_iter()
@@ -637,7 +639,7 @@ pub fn refresh(a: &mut App) {
                     (Some(f), Some(s)) => f.eq_ignore_ascii_case(s),
                     (Some(_), None) => false,
                 })
-                .take(MAX_ROWS)
+                .take(limit)
                 .map(|i| {
                     let app = i.source_app.as_deref().map(|s| app_display_name(s).to_string());
                     let when = relative_time(now, i.last_used);

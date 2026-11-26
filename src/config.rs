@@ -45,6 +45,8 @@ pub struct Config {
     pub merge_separator: String,
     pub popup_width: u32,
     pub popup_height: u32,
+    /// 팝업 "기록" 탭에 보여 줄 최근 항목 수(보관 개수와 별개)
+    pub popup_rows: usize,
     pub font_name: String,
     pub font_size: u32,
     pub excluded_apps: Vec<String>,
@@ -77,11 +79,12 @@ impl Default for Config {
             ignore_whitespace_only: true,
             popup_position: PopupPosition::Caret,
             theme: Theme::Dark,
-            popup_opacity: 80,
+            popup_opacity: 100,
             show_preview: false,
             merge_separator: "\n".into(),
             popup_width: 480,
             popup_height: 760,
+            popup_rows: 40,
             font_name: "맑은 고딕".into(),
             font_size: 10,
             excluded_apps: DEFAULT_EXCLUDED.iter().map(|s| s.to_string()).collect(),
@@ -152,6 +155,7 @@ impl Config {
         c.max_items = c.max_items.clamp(10, 100_000);
         c.popup_width = c.popup_width.clamp(240, 2000);
         c.popup_height = c.popup_height.clamp(200, 2000);
+        c.popup_rows = c.popup_rows.clamp(5, 2000);
         c.font_size = c.font_size.clamp(6, 40);
         c.popup_opacity = c.popup_opacity.clamp(50, 100);
         if c.ai_ocr_model.trim().is_empty() {
@@ -294,11 +298,13 @@ ignore_whitespace_only = true
 popup_position = "caret"
 popup_width = 480
 popup_height = 760
+# 팝업 "기록" 탭에 보여 줄 최근 항목 수(더 오래된 것도 보관은 됩니다)
+popup_rows = 40
 
 # 팝업 모양: "dark"(어두운 테마) 또는 "light"(밝은 테마)
 theme = "dark"
 # 팝업 불투명도(%). 100 이면 투명하지 않음, 낮을수록 뒤가 비침(50~100)
-popup_opacity = 80
+popup_opacity = 100
 # 아래쪽 미리보기 칸을 처음부터 보이기(팝업에서 F3 으로 켜고 끌 수 있음)
 show_preview = false
 

@@ -38,6 +38,7 @@ const ID_WIDTH: i32 = 106;
 const ID_HEIGHT: i32 = 107;
 const ID_FONT_SIZE: i32 = 108;
 const ID_MAX_ITEMS: i32 = 109;
+const ID_POPUP_ROWS: i32 = 113;
 const ID_SEPARATOR: i32 = 110;
 const ID_AI_KEY: i32 = 111;
 const ID_SYNC: i32 = 112;
@@ -112,7 +113,7 @@ pub fn open(a: &mut App) {
         );
         FONT.store(font as isize, Ordering::Relaxed);
 
-        let rows = 11;
+        let rows = 12;
         let checks = 7;
         let row_h = s(30);
         let client_w = s(470);
@@ -174,6 +175,8 @@ pub fn open(a: &mut App) {
         edit(ID_HEIGHT, &c.popup_height.to_string(), ctl_x + s(94), yy, s(70), ES_NUMBER as u32);
         let yy = row("글자 크기", &mut y);
         edit(ID_FONT_SIZE, &c.font_size.to_string(), ctl_x, yy, s(70), ES_NUMBER as u32);
+        let yy = row("팝업에 보일 최근 항목 수", &mut y);
+        edit(ID_POPUP_ROWS, &c.popup_rows.to_string(), ctl_x, yy, s(70), ES_NUMBER as u32);
         let yy = row("보관할 기록 개수", &mut y);
         edit(ID_MAX_ITEMS, &c.max_items.to_string(), ctl_x, yy, s(70), ES_NUMBER as u32);
         let yy = row("여러 개 합칠 때 사이에", &mut y);
@@ -285,6 +288,7 @@ unsafe fn save(a: &mut App, hwnd: HWND) -> Result<(), String> {
         ("popup_height", number(hwnd, ID_HEIGHT, "팝업 세로", 200, 2000)?),
         ("font_size", number(hwnd, ID_FONT_SIZE, "글자 크기", 6, 40)?),
         ("max_items", number(hwnd, ID_MAX_ITEMS, "보관 개수", 10, 100_000)?),
+        ("popup_rows", number(hwnd, ID_POPUP_ROWS, "팝업에 보일 개수", 5, 2000)?),
         ("anthropic_api_key", Value::String(text_of(hwnd, ID_AI_KEY))),
         ("sync_folder", Value::String(text_of(hwnd, ID_SYNC))),
         ("paste_after_select", Value::Boolean(checked(hwnd, ID_PASTE_AFTER))),
