@@ -162,6 +162,8 @@ pub struct Popup {
     /// 이 프로그램에서 복사한 것만 보기(None = 모든 프로그램)
     pub app_filter: Option<String>,
     app_chip: RECT,
+    /// 열릴 때 서서히 나타나기(남은 단계)
+    fade_step: u32,
 }
 
 impl Default for Popup {
@@ -195,6 +197,7 @@ impl Default for Popup {
             viewer_id: None,
             app_filter: None,
             app_chip: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+            fade_step: 0,
         }
     }
 }
@@ -474,9 +477,16 @@ fn layout(p: &mut Popup) {
 }
 
 /// 팝업을 엽니다. `target` 은 붙여넣을 창(없으면 클립보드에 복사만).
+const TIMER_FADE: usize = 0x5A01;
+const TIMER_SYNC_LATER: usize = 0x5A02;
+const FADE_STEPS: u32 = 4;
+
+fn target_alpha(a: &App) -> u8 {
+    (a.config.popup_opacity as u32 * 255 / 100) as u8
+}
+
 pub fn show(a: &mut App, target: HWND, at_mouse: bool) {
     a.reload_config(false);
-    a.sync_pull();
     let target = if util::is_own_window(target) { null_mut() } else { target };
     a.popup.target = target;
 
@@ -534,18 +544,58 @@ pub fn show(a: &mut App, target: HWND, at_mouse: bool) {
         p.rows.clear();
         refresh(a);
         select(&a.popup, 0);
+        let alpha = target_alpha(a);
         let p = &mut a.popup;
+        // 지난번 화면이 잠깐 비치지 않도록, 투명한 상태로 띄워 새 내용을 다 그린 뒤 서서히 보여 줍니다.
+        SetLayeredWindowAttributes(p.hwnd, 0, 0, LWA_ALPHA);
         ShowWindow(p.hwnd, SW_SHOW);
         SetForegroundWindow(p.hwnd);
         SetFocus(p.list);
+        RedrawWindow(p.hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        p.fade_step = 1;
+        SetLayeredWindowAttributes(p.hwnd, 0, (alpha as u32 / FADE_STEPS) as u8, LWA_ALPHA);
+        SetTimer(p.hwnd, TIMER_FADE, 15, None);
+        // 다른 PC 기록 합치기는 팝업이 뜬 다음에(폴더가 느려도 여는 게 늦어지지 않게)
+        SetTimer(p.hwnd, TIMER_SYNC_LATER, 120, None);
+    }
+}
+
+unsafe fn on_popup_timer(a: &mut App, hwnd: HWND, id: usize) {
+    match id {
+        TIMER_FADE => {
+            let alpha = target_alpha(a) as u32;
+            let p = &mut a.popup;
+            p.fade_step += 1;
+            if p.fade_step >= FADE_STEPS || !p.visible() {
+                KillTimer(hwnd, TIMER_FADE);
+                p.fade_step = 0;
+                SetLayeredWindowAttributes(hwnd, 0, alpha as u8, LWA_ALPHA);
+            } else {
+                SetLayeredWindowAttributes(hwnd, 0, (alpha * p.fade_step / FADE_STEPS) as u8, LWA_ALPHA);
+            }
+        }
+        TIMER_SYNC_LATER => {
+            KillTimer(hwnd, TIMER_SYNC_LATER);
+            if a.popup.visible() && a.popup.editing.is_none() {
+                a.sync_pull();
+            }
+        }
+        _ => {}
     }
 }
 
 pub fn hide(a: &mut App) {
+    let alpha = target_alpha(a);
     let p = &mut a.popup;
     close_viewer(p, false);
     if p.visible() {
-        unsafe { ShowWindow(p.hwnd, SW_HIDE) };
+        unsafe {
+            KillTimer(p.hwnd, TIMER_FADE);
+            KillTimer(p.hwnd, TIMER_SYNC_LATER);
+            ShowWindow(p.hwnd, SW_HIDE);
+            SetLayeredWindowAttributes(p.hwnd, 0, alpha, LWA_ALPHA);
+        }
+        p.fade_step = 0;
     }
     end_edit(p);
     p.image_cache = None;
@@ -1359,6 +1409,24 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
             }
         }
+        // 배경은 마지막 줄 아래 빈 곳만 칠합니다(줄은 직접 그리므로 지웠다 그리는 깜빡임 방지)
+        WM_ERASEBKGND => {
+            let a = app();
+            let dc = wp as HDC;
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let n = SendMessageW(hwnd, LB_GETCOUNT, 0, 0);
+            if n > 0 {
+                let mut last: RECT = std::mem::zeroed();
+                if SendMessageW(hwnd, LB_GETITEMRECT, (n - 1) as usize, &mut last as *mut RECT as LPARAM) != LB_ERR as isize {
+                    rc.top = rc.top.max(last.bottom);
+                }
+            }
+            if rc.bottom > rc.top {
+                fill(dc, &rc, a.popup.pal.bg);
+            }
+            return 1;
+        }
         // 글자 입력은 쓰지 않습니다(삑 소리 방지)
         WM_CHAR => return 0,
         // Tab/Enter/Esc 등 모든 키를 목록이 직접 받도록
@@ -1452,7 +1520,12 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             1
         }
         WM_DRAWITEM => {
-            draw_row(a, &*(lp as *const DRAWITEMSTRUCT));
+            let dis = *(lp as *const DRAWITEMSTRUCT);
+            buffered(dis.hDC, &dis.rcItem, |m| {
+                let mut d = dis;
+                d.hDC = m;
+                draw_row(a, &d);
+            });
             1
         }
         WM_PAINT => {
@@ -1460,6 +1533,10 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             0
         }
         WM_ERASEBKGND => 1,
+        WM_TIMER => {
+            on_popup_timer(a, hwnd, wp);
+            0
+        }
         WM_DPICHANGED => {
             set_dpi(a, (wp & 0xFFFF) as u32);
             let r = &*(lp as *const RECT);
@@ -1520,6 +1597,41 @@ unsafe fn text_width(dc: HDC, s: &str, font: HFONT) -> i32 {
 unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut ps);
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    buffered(dc, &rc, |m| paint_chrome_into(a, hwnd, m));
+    EndPaint(hwnd, &ps);
+}
+
+/// 화면 밖 비트맵에 먼저 그린 뒤 한 번에 옮깁니다(깜빡임 없음).
+/// `f` 안에서는 원래 DC 와 같은 좌표를 그대로 씁니다.
+unsafe fn buffered(dc: HDC, rc: &RECT, f: impl FnOnce(HDC)) {
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 {
+        return f(dc);
+    }
+    let mem = CreateCompatibleDC(dc);
+    let bmp = CreateCompatibleBitmap(dc, w, h);
+    if mem.is_null() || bmp.is_null() {
+        if !bmp.is_null() {
+            DeleteObject(bmp as HGDIOBJ);
+        }
+        if !mem.is_null() {
+            DeleteDC(mem);
+        }
+        return f(dc);
+    }
+    let old = SelectObject(mem, bmp as HGDIOBJ);
+    SetViewportOrgEx(mem, -rc.left, -rc.top, null_mut());
+    f(mem);
+    SetViewportOrgEx(mem, 0, 0, null_mut());
+    BitBlt(dc, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bmp as HGDIOBJ);
+    DeleteDC(mem);
+}
+
+unsafe fn paint_chrome_into(a: &mut App, hwnd: HWND, dc: HDC) {
     let p = &mut a.popup;
     let pal = p.pal;
     let mut rc: RECT = std::mem::zeroed();
@@ -1608,7 +1720,6 @@ unsafe fn paint_chrome(a: &mut App, hwnd: HWND) {
         r.right -= text_width(dc, "● 일시정지", p.font_small) + p.scale(8);
     }
     draw_text(dc, &hint, &mut r, color, p.font_small, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    EndPaint(hwnd, &ps);
 }
 
 fn clear_thumbs(p: &mut Popup) {
@@ -1776,9 +1887,11 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let dc = BeginPaint(hwnd, &mut ps);
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut rc);
-            fill(dc, &rc, a.popup.pal.bg);
-            fill_round(dc, &rc, a.popup.scale(12), a.popup.pal.surface);
-            paint_preview(a, dc, rc);
+            buffered(dc, &rc, |m| {
+                fill(m, &rc, a.popup.pal.bg);
+                fill_round(m, &rc, a.popup.scale(12), a.popup.pal.surface);
+                paint_preview(a, m, rc);
+            });
             EndPaint(hwnd, &ps);
             0
         }
