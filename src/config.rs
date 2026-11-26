@@ -64,7 +64,7 @@ impl Default for Config {
             hotkey: "Alt+C".into(),
             capture_hotkey: "Ctrl+Alt+C".into(),
             double_copy_ms: 0,
-            max_items: 300,
+            max_items: 1000,
             capture_text: true,
             capture_images: true,
             capture_files: true,
@@ -80,8 +80,8 @@ impl Default for Config {
             popup_opacity: 80,
             show_preview: false,
             merge_separator: "\n".into(),
-            popup_width: 440,
-            popup_height: 480,
+            popup_width: 480,
+            popup_height: 760,
             font_name: "맑은 고딕".into(),
             font_size: 10,
             excluded_apps: DEFAULT_EXCLUDED.iter().map(|s| s.to_string()).collect(),
@@ -209,7 +209,7 @@ capture_hotkey = "Ctrl+Alt+C"
 double_copy_ms = 0
 
 # 보관할 기록 개수(고정한 항목은 개수에 포함되지 않고 지워지지도 않습니다)
-max_items = 300
+max_items = 1000
 
 # 어떤 종류를 기록할지
 capture_text = true
@@ -237,8 +237,8 @@ ignore_whitespace_only = true
 
 # 팝업 위치: "caret"(입력 커서 옆), "mouse"(마우스 위치), "center"(화면 가운데)
 popup_position = "caret"
-popup_width = 440
-popup_height = 480
+popup_width = 480
+popup_height = 760
 
 # 팝업 모양: "dark"(어두운 테마) 또는 "light"(밝은 테마)
 theme = "dark"

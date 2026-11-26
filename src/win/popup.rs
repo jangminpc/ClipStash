@@ -414,7 +414,7 @@ fn text_height(hwnd: HWND, font: HFONT) -> i32 {
 }
 
 fn row_height(p: &Popup) -> i32 {
-    p.font_h + p.scale(14)
+    p.font_h + p.scale(11)
 }
 
 /// 이미지 항목 줄 높이(썸네일이 들어갈 만큼)
@@ -511,9 +511,10 @@ pub fn show(a: &mut App, target: HWND, at_mouse: bool) {
             set_dpi(a, dx);
         }
         let p = &mut a.popup;
-        let w = p.scale(a.config.popup_width as i32);
-        let h = p.scale(a.config.popup_height as i32);
         let wa = mi.rcWork;
+        // 화면보다 크면 화면에 맞춥니다(가로 95%, 세로 90%).
+        let w = p.scale(a.config.popup_width as i32).min((wa.right - wa.left) * 95 / 100);
+        let h = p.scale(a.config.popup_height as i32).min((wa.bottom - wa.top) * 9 / 10);
         let (mut x, mut y);
         if a.config.popup_position == PopupPosition::Center && !at_mouse {
             x = wa.left + (wa.right - wa.left - w) / 2;

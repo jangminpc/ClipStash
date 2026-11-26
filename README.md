@@ -179,7 +179,7 @@ Anthropic 의 Claude API 키를 넣으면 같은 O 키가 **AI 로 글자를 읽
 hotkey = "Alt+C"               # 팝업 단축키. 예: "Ctrl+Shift+V", "F9", 끄려면 ""
 capture_hotkey = "Ctrl+Alt+C"  # 화면 캡처 단축키, 끄려면 ""
 double_copy_ms = 0             # 400 등으로 두면 Ctrl+C 두 번으로도 열기, 0 이면 끔
-max_items = 300                # 보관 개수(고정 항목 제외)
+max_items = 1000               # 보관 개수(고정 항목 제외)
 capture_images = true          # 이미지도 기록
 paste_after_select = true      # 고르면 바로 붙여넣기(false 면 복사만)
 plain_text_by_default = false  # 항상 서식 없이 붙여넣기
