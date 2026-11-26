@@ -1271,6 +1271,33 @@ fn context_menu_at_selection(a: &mut App) {
     }
 }
 
+/// T: 지금 줄을 바꿔서(대문자, 한 줄로, 공백 제거 등) 붙여넣기 메뉴
+fn transform_menu_at_selection(a: &mut App) {
+    let Some(i) = a.popup.selected_index() else { return };
+    let Some(row) = a.popup.selected() else { return };
+    if let RowRef::Clip(id) = row {
+        if matches!(a.history.get(id).map(|i| &i.content), Some(ClipContent::Image { .. })) {
+            return;
+        }
+    }
+    unsafe {
+        let mut rc: RECT = std::mem::zeroed();
+        SendMessageW(a.popup.list, LB_GETITEMRECT, i, &mut rc as *mut RECT as LPARAM);
+        let mut pt = POINT { x: rc.left + a.popup.scale(40), y: rc.bottom };
+        ClientToScreen(a.popup.list, &mut pt);
+        let m = CreatePopupMenu();
+        for (k, t) in Transform::ALL.iter().enumerate() {
+            let label = wide(&format!("&{}  {}", k + 1, t.label()));
+            AppendMenuW(m, MF_STRING, M_TRANSFORM + k, label.as_ptr());
+        }
+        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, a.popup.hwnd, null()) as usize;
+        DestroyMenu(m);
+        if (M_TRANSFORM..M_TRANSFORM + Transform::ALL.len()).contains(&cmd) {
+            activate(a, Some(row), Action::Transform(Transform::ALL[cmd - M_TRANSFORM]));
+        }
+    }
+}
+
 // ── 창 프로시저들 ─────────────────────────────────────────────
 
 fn key_down(vk: VIRTUAL_KEY) -> bool {
@@ -1339,6 +1366,7 @@ fn handle_key(a: &mut App, vk: VIRTUAL_KEY) -> bool {
                 }
             }
             b'K' => kakao_key(a),
+            b'T' => transform_menu_at_selection(a),
             b'Q' => queue_key(a),
             b'A' => app_menu_at_chip(a),
             _ => return false,
@@ -1354,10 +1382,7 @@ fn handle_key(a: &mut App, vk: VIRTUAL_KEY) -> bool {
                     a.save_as_template(id);
                 }
             }
-            b'E' => {
-                hide(a);
-                a.open_config_file();
-            }
+            b'E' => super::settings::open(a),
             b'C' => {
                 let row = a.popup.selected();
                 activate(a, row, Action::CopyOnly);
@@ -1705,7 +1730,7 @@ unsafe fn paint_chrome_into(a: &mut App, hwnd: HWND, dc: HDC) {
         let h = match p.tab {
             Tab::Templates => "1~9 · Enter 붙여넣기  ·  F2 고쳐서 붙여넣기  ·  Ctrl+E 편집",
             _ if selected_is_image => "Enter 붙여넣기  ·  V 크게 보기  ·  O 글자 추출  ·  우클릭 메뉴",
-            _ => "1~9 붙여넣기  ·  체크(Space)한 순서대로 합치기  ·  F2 고쳐서",
+            _ => "1~9 붙여넣기  ·  체크(Space) 순서대로 합치기  ·  T 바꿔서",
         };
         (h.to_string(), pal.muted)
     };

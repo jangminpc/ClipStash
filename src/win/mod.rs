@@ -8,6 +8,7 @@ mod net;
 mod ocr;
 mod paste;
 mod popup;
+mod settings;
 mod util;
 mod worker;
 
@@ -73,6 +74,7 @@ const CMD_IMPORT: usize = 14;
 const CMD_KAKAO: usize = 15;
 const CMD_KAKAO_OFF: usize = 16;
 const CMD_SYNC_NOW: usize = 17;
+const CMD_SETTINGS: usize = 18;
 
 /// 항목을 골랐을 때 할 일
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -232,6 +234,7 @@ pub fn run() {
         };
         RegisterClassExW(&wc);
         popup::register_classes(hinst);
+        settings::register(hinst);
         capture::register_class(hinst);
 
         let app_box = Box::new(App {
@@ -292,6 +295,11 @@ pub fn run() {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            // 설정 창의 Tab/Enter/Esc
+            let dlg = settings::dialog_hwnd();
+            if !dlg.is_null() && IsDialogMessageW(dlg, &msg) != 0 {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1061,7 +1069,8 @@ impl App {
             add(MF_STRING | checked(self.paused), CMD_PAUSE, "기록 일시정지");
             add(MF_STRING | checked(util::autostart_enabled()), CMD_AUTOSTART, "Windows 시작 시 자동 실행");
             add(MF_SEPARATOR, 0, "");
-            add(MF_STRING, CMD_EDIT_CONFIG, "설정 파일 열기 (템플릿·단축키·제외 프로그램)");
+            add(MF_STRING, CMD_SETTINGS, "설정…");
+            add(MF_STRING, CMD_EDIT_CONFIG, "설정 파일 직접 열기 (템플릿·제외 프로그램)");
             add(MF_STRING, CMD_RELOAD, "설정 다시 불러오기");
             add(MF_STRING, CMD_DATA_DIR, "데이터 폴더 열기");
             add(MF_SEPARATOR, 0, "");
@@ -1124,6 +1133,7 @@ impl App {
                     self.balloon("자동 실행 설정을 바꾸지 못했습니다", "레지스트리에 쓸 수 없습니다.", true);
                 }
             }
+            CMD_SETTINGS => settings::open(self),
             CMD_EDIT_CONFIG => self.open_config_file(),
             CMD_RELOAD => self.reload_config(true),
             CMD_DATA_DIR => util::shell_open(&self.data_dir.display().to_string(), None),

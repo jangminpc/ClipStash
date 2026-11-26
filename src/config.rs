@@ -193,6 +193,61 @@ impl Config {
     }
 }
 
+/// 한 줄짜리 TOML 값(문자열은 항상 "..." 한 줄로)
+fn inline_value(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => {
+            let mut o = String::from("\"");
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    '\r' => o.push_str("\\r"),
+                    '\t' => o.push_str("\\t"),
+                    c if (c as u32) < 0x20 || c as u32 == 0x7f => o.push_str(&format!("\\u{:04X}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o.push('"');
+            o
+        }
+        other => other.to_string(),
+    }
+}
+
+/// 설정 파일 글의 맨 위(첫 `[` 구역 앞) `키 = 값` 줄만 바꿔 씁니다. 주석과 템플릿은 그대로 둡니다.
+/// 없는 키는 첫 구역 바로 앞(없으면 끝)에 붙입니다. 배열·여러 줄 값은 다루지 않습니다.
+pub fn set_top_level_values(text: &str, values: &[(&str, toml::Value)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let section_at = |lines: &[String]| lines.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(lines.len());
+    for (key, value) in values {
+        let new_line = format!("{} = {}", key, inline_value(value));
+        let end = section_at(&lines);
+        let found = lines[..end].iter().position(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#')
+                && t.strip_prefix(key).map(|r| r.trim_start().starts_with('=')).unwrap_or(false)
+        });
+        match found {
+            Some(i) => lines[i] = new_line,
+            None => {
+                // 구역 앞의 빈 줄 위에 넣어 보기 좋게
+                let mut at = end;
+                while at > 0 && end < lines.len() && lines[at - 1].trim().is_empty() {
+                    at -= 1;
+                }
+                lines.insert(at, new_line);
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// 처음 실행할 때 만들어지는 설명이 달린 설정 파일.
 pub const DEFAULT_CONFIG_TOML: &str = r#"# ClipStash 설정 파일
 # 저장하면 다음에 팝업을 열 때 자동으로 다시 읽습니다.
@@ -376,5 +431,35 @@ mod tests {
         assert!(!c.is_excluded("notepad.exe"));
         assert!(!c.is_excluded(""));
         assert!(c.uses_shift_insert("PuTTY.exe"));
+    }
+
+    #[test]
+    fn set_values_keeps_comments_and_sections() {
+        let text = "# 주석\nmax_items = 300\n# popup_width = 1\npopup_width = 440\n\n[[templates]]\nname = \"a\"\ntext = \"b\"\n";
+        let out = set_top_level_values(
+            text,
+            &[
+                ("max_items", toml::Value::Integer(1000)),
+                ("popup_width", toml::Value::Integer(480)),
+                ("hotkey", toml::Value::String("Alt+V".into())),
+                ("merge_separator", toml::Value::String("\n".into())),
+            ],
+        );
+        assert!(out.starts_with("# 주석\nmax_items = 1000\n# popup_width = 1\npopup_width = 480\n"));
+        assert!(out.contains("hotkey = \"Alt+V\"\nmerge_separator = \"\\n\"\n\n[[templates]]"));
+        let c = Config::from_toml(&out).unwrap();
+        assert_eq!((c.max_items, c.popup_width, c.hotkey.as_str(), c.merge_separator.as_str()), (1000, 480, "Alt+V", "\n"));
+        assert_eq!(c.templates.len(), 1);
+        // 템플릿 안의 같은 이름 키는 건드리지 않음
+        let out2 = set_top_level_values(&out, &[("name", toml::Value::String("x".into()))]);
+        assert!(out2.contains("name = \"a\""));
+    }
+
+    #[test]
+    fn set_values_on_default_file() {
+        let out = set_top_level_values(DEFAULT_CONFIG_TOML, &[("popup_opacity", toml::Value::Integer(70)), ("theme", toml::Value::String("light".into()))]);
+        let c = Config::from_toml(&out).unwrap();
+        assert_eq!((c.popup_opacity, c.theme), (70, Theme::Light));
+        assert_eq!(c.templates.len(), Config::default().templates.len());
     }
 }
