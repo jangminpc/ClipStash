@@ -1325,14 +1325,14 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 return 0;
             }
         }
-        // 체크박스를 누르면 체크/해제(체크한 순서대로 번호가 붙음)
+        // 체크박스를 누르면 체크/해제(체크한 순서대로 번호가 붙음), 나머지 곳은 한 번 클릭 = 붙여넣기
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if !key_down(VK_CONTROL) && !key_down(VK_SHIFT) => {
             let a = app();
             let r = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lp);
             if (r >> 16) & 0xFFFF == 0 {
                 let idx = (r & 0xFFFF) as usize;
                 let x = (lp & 0xFFFF) as i16 as i32;
-                let (_, check_r, _, content_l) = a.popup.lead_x();
+                let (_, check_r, _, _) = a.popup.lead_x();
                 if let Some(RowRef::Clip(_)) = a.popup.rows.get(idx).map(|row| row.r) {
                     if x < check_r + a.popup.scale(3) {
                         select(&a.popup, idx as isize);
@@ -1341,18 +1341,21 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         return 0;
                     }
                 }
-                // 썸네일을 누르면 크게 보기
-                if let (WM_LBUTTONDOWN, Some(RowRef::Clip(id))) = (msg, a.popup.rows.get(idx).map(|row| row.r)) {
-                    let p = &a.popup;
-                    let x0 = content_l;
-                    let x1 = x0 + THUMB_W * p.dpi as i32 / 96;
-                    let is_image = matches!(a.history.get(id).map(|i| &i.content), Some(ClipContent::Image { .. }));
-                    if is_image && x >= x0 && x <= x1 {
-                        select(&a.popup, idx as isize);
-                        SetFocus(hwnd);
-                        open_viewer(a, id);
+                // 그 밖의 곳을 한 번 누르면 바로 붙여넣기.
+                // 이미 체크한 항목이 있으면 붙여넣지 않고 체크에 넣거나 뺍니다(Enter로 한 번에).
+                if let Some(row) = a.popup.rows.get(idx).map(|row| row.r) {
+                    select(&a.popup, idx as isize);
+                    SetFocus(hwnd);
+                    if !a.popup.marks.is_empty() {
+                        if let RowRef::Clip(_) = row {
+                            toggle_mark(&mut a.popup);
+                        }
                         return 0;
                     }
+                    if msg == WM_LBUTTONDOWN {
+                        activate(a, Some(row), Action::Paste);
+                    }
+                    return 0;
                 }
             }
         }
