@@ -18,6 +18,8 @@ jobs:
   build-windows:
     name: Windows 빌드 + 실행 확인
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,6 +77,19 @@ jobs:
         with:
           name: manager-screenshot
           path: manager.png
+
+      - name: 캡처를 ci-screens 브랜치에 올리기 (참고용)
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\manager.png"))
+          $path = "screens/manager-${{ github.sha }}.png"
+          $body = @{ message = "CI 캡처 ${{ github.sha }}"; content = $b64; branch = "ci-screens" } | ConvertTo-Json
+          $body | Out-File -Encoding utf8 body.json
+          gh api -X PUT "repos/${{ github.repository }}/contents/$path" --input body.json | Out-Null
+          Write-Host "올림: $path"
 
       - name: 글자 추출(OCR)·HTTPS 점검 (참고용)
         continue-on-error: true
