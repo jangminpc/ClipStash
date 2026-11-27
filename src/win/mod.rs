@@ -1,0 +1,1361 @@
+//! Windows 전용 부분: 숨은 메인 창(클립보드 감시, 전역 단축키, 트레이 아이콘)과 팝업.
+
+mod backup;
+mod capture;
+mod clip;
+mod kakao;
+mod manager;
+mod net;
+mod ocr;
+mod paste;
+mod popup;
+mod settings;
+mod util;
+mod worker;
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+use clipstash::config::{Config, DEFAULT_CONFIG_TOML};
+use clipstash::history::{ClipContent, History};
+use clipstash::template::{self, Template};
+use clipstash::transform::Transform;
+use clipstash::hotkey::DoubleTap;
+use clipstash::{bmp, hash, hotkey, storage};
+
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, GetClipboardOwner, RemoveClipboardFormatListener,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_CONTROL,
+    VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
+use windows_sys::Win32::UI::Shell::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+use util::wide;
+
+pub const WM_APP_TRAY: u32 = WM_APP + 1;
+pub const WM_APP_SHOW: u32 = WM_APP + 2;
+pub const WM_APP_DOUBLE_COPY: u32 = WM_APP + 3;
+/// 순차 붙여넣기: 키보드 훅이 Ctrl+V 를 가로챘음
+pub const WM_APP_QUEUE_PASTE: u32 = WM_APP + 4;
+const HOTKEY_ID: i32 = 1;
+const HOTKEY_CAPTURE: i32 = 2;
+const HOTKEY_MANAGER: i32 = 3;
+const TIMER_SAVE: usize = 1;
+const TIMER_SYNC: usize = 2;
+const MAIN_CLASS: &str = "ClipStash.Main";
+// NIN_SELECT / NIN_KEYSELECT (shellapi.h)
+const TRAY_SELECT: u32 = WM_USER;
+const TRAY_KEYSELECT: u32 = WM_USER + 1;
+
+// 트레이 메뉴 명령
+const CMD_OPEN: usize = 1;
+const CMD_PAUSE: usize = 2;
+const CMD_AUTOSTART: usize = 3;
+const CMD_EDIT_CONFIG: usize = 4;
+const CMD_RELOAD: usize = 5;
+const CMD_DATA_DIR: usize = 6;
+const CMD_CLEAR: usize = 7;
+const CMD_ABOUT: usize = 8;
+const CMD_EXIT: usize = 9;
+const CMD_CAPTURE: usize = 10;
+const CMD_CAPTURE_OCR: usize = 11;
+const CMD_QUEUE: usize = 12;
+const CMD_EXPORT: usize = 13;
+const CMD_IMPORT: usize = 14;
+const CMD_KAKAO: usize = 15;
+const CMD_KAKAO_OFF: usize = 16;
+const CMD_SYNC_NOW: usize = 17;
+const CMD_SETTINGS: usize = 18;
+const CMD_MANAGER: usize = 19;
+
+/// 항목을 골랐을 때 할 일
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// 설정에 따라(서식 포함 또는 텍스트만) 붙여넣기
+    Paste,
+    /// 서식 없이 텍스트만 붙여넣기
+    PastePlain,
+    /// 텍스트를 바꿔서 붙여넣기
+    Transform(Transform),
+    /// 클립보드에 넣기만 하고 붙여넣지 않음
+    CopyOnly,
+}
+
+pub struct App {
+    pub hinst: HINSTANCE,
+    pub main: HWND,
+    pub data_dir: PathBuf,
+    pub config: Config,
+    config_mtime: Option<SystemTime>,
+    pub history: History,
+    pub paused: bool,
+    pub formats: clip::Formats,
+    icon_normal: HICON,
+    icon_paused: HICON,
+    hotkey_ok: bool,
+    capture_hotkey_ok: bool,
+    manager_hotkey_ok: bool,
+    kb_hook: HHOOK,
+    taskbar_created: u32,
+    pub popup: popup::Popup,
+    pub manager: manager::Manager,
+    pub capture: capture::Capture,
+    /// 순차 붙여넣기 대기열(앞에서부터 붙여넣음)
+    pub queue: VecDeque<u64>,
+    /// 순차 붙여넣기 모드: 켜져 있으면 새로 복사한 항목이 대기열 뒤에 붙습니다.
+    pub queue_on: bool,
+    /// 팝업에서 고른 항목으로 시작한 대기열이면, 다 붙여넣은 뒤 모드를 끕니다.
+    queue_auto_off: bool,
+    sync_seen: backup::SyncSeen,
+    sync_warned: bool,
+    kakao_busy: bool,
+}
+
+static APP: AtomicPtr<App> = AtomicPtr::new(null_mut());
+
+/// 이 프로그램은 UI 스레드 하나에서만 동작하므로 전역 상태를 이렇게 꺼내 씁니다.
+pub fn app() -> &'static mut App {
+    unsafe { &mut *APP.load(Ordering::Relaxed) }
+}
+
+/// CI 에서 쓰는 점검용 명령: `--ocr-test 그림.bmp 결과.txt`, `--net-test 결과.txt`
+fn self_test() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let out = |path: &str, text: String| {
+        let _ = std::fs::write(path, text);
+    };
+    match args.get(1).map(String::as_str) {
+        Some("--ocr-test") if args.len() >= 4 => {
+            let data = std::fs::read(&args[2]).unwrap_or_default();
+            let r = bmp::bmp_to_dib(&data)
+                .and_then(|dib| ocr::dib_to_bgra(dib, ocr::MAX_SIDE))
+                .ok_or_else(|| "이미지를 읽지 못함".to_string())
+                .and_then(|(w, h, px)| ocr::recognize(w, h, px));
+            out(&args[3], match r { Ok(t) => format!("OK\n{}", t), Err(e) => format!("ERR\n{}", e) });
+            true
+        }
+        Some("--ai-ocr-test") if args.len() >= 4 => {
+            // 키는 환경 변수 ANTHROPIC_API_KEY 에서
+            let data = std::fs::read(&args[2]).unwrap_or_default();
+            let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+            let r = bmp::bmp_to_dib(&data)
+                .and_then(ocr::dib_to_png_for_ai)
+                .ok_or_else(|| "이미지를 읽지 못함".to_string())
+                .and_then(|png| ocr::recognize_ai(&key, clipstash::ai_ocr::DEFAULT_MODEL, &png));
+            out(&args[3], match r { Ok(t) => format!("OK\n{}", t), Err(e) => format!("ERR\n{}", e) });
+            true
+        }
+        Some("--net-test") if args.len() >= 3 => {
+            let r = net::post_form(clipstash::kakao::AUTH_HOST, clipstash::kakao::TOKEN_PATH, None, "grant_type=refresh_token&client_id=x&refresh_token=x");
+            out(&args[2], match r { Ok((st, b)) => format!("HTTP {}\n{}", st, b), Err(e) => format!("ERR\n{}", e) });
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn run() {
+    if self_test() {
+        return;
+    }
+    unsafe {
+        // 이미 실행 중이면 그쪽 팝업만 띄우고 끝냅니다.
+        let mutex_name = wide("Local\\ClipStash.SingleInstance");
+        let _mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let cls = wide(MAIN_CLASS);
+            let other = FindWindowW(cls.as_ptr(), null());
+            if !other.is_null() {
+                PostMessageW(other, WM_APP_SHOW, 0, 0);
+            }
+            return;
+        }
+        // 매니페스트에도 적혀 있지만 혹시 몰라 한 번 더
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let hinst = GetModuleHandleW(null());
+        let data_dir = util::data_dir();
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            util::message_box(
+                null_mut(),
+                &format!("데이터 폴더를 만들 수 없습니다:\n{}\n\n{}", data_dir.display(), e),
+                MB_ICONERROR,
+            );
+            return;
+        }
+
+        // 설정 파일이 없으면 설명이 달린 기본 파일을 만듭니다.
+        let config_path = data_dir.join(storage::CONFIG_FILE);
+        if !config_path.exists() {
+            let _ = std::fs::write(&config_path, DEFAULT_CONFIG_TOML);
+        }
+        let mut config_error = None;
+        let config = match std::fs::read_to_string(&config_path) {
+            Ok(s) => Config::from_toml(&s).unwrap_or_else(|e| {
+                config_error = Some(e);
+                Config::default()
+            }),
+            Err(_) => Config::default(),
+        };
+        let config_mtime = std::fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+
+        let mut history = storage::load_history(&data_dir);
+        let evicted = history.trim(config.max_items);
+        storage::delete_item_files(&data_dir, &evicted);
+        storage::remove_orphan_images(&data_dir, &history);
+
+        let load_icon = |id: u16, size: i32| {
+            LoadImageW(hinst, id as usize as *const u16, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) as HICON
+        };
+        let small = GetSystemMetrics(SM_CXSMICON);
+        let icon_normal = load_icon(1, small);
+        let icon_paused = load_icon(2, small);
+
+        let cls = wide(MAIN_CLASS);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(main_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: load_icon(1, GetSystemMetrics(SM_CXICON)),
+            hCursor: null_mut(),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: cls.as_ptr(),
+            hIconSm: icon_normal,
+        };
+        RegisterClassExW(&wc);
+        popup::register_classes(hinst);
+        settings::register(hinst);
+        manager::register(hinst);
+        capture::register_class(hinst);
+
+        let app_box = Box::new(App {
+            hinst,
+            main: null_mut(),
+            data_dir,
+            config,
+            config_mtime,
+            history,
+            paused: false,
+            formats: clip::Formats::register(),
+            icon_normal,
+            icon_paused,
+            hotkey_ok: false,
+            capture_hotkey_ok: false,
+            manager_hotkey_ok: false,
+            manager: manager::Manager::default(),
+            kb_hook: null_mut(),
+            taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
+            popup: popup::Popup::default(),
+            capture: capture::Capture::default(),
+            queue: VecDeque::new(),
+            queue_on: false,
+            queue_auto_off: false,
+            sync_seen: Default::default(),
+            sync_warned: false,
+            kakao_busy: false,
+        });
+        APP.store(Box::into_raw(app_box), Ordering::Relaxed);
+
+        // 숨은 최상위 창(TaskbarCreated 방송을 받으려면 메시지 전용 창이면 안 됨)
+        let title = wide("ClipStash");
+        let main = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            cls.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            hinst,
+            null(),
+        );
+        let a = app();
+        a.main = main;
+        popup::create(a);
+        AddClipboardFormatListener(main);
+        a.tray(NIM_ADD);
+        a.register_hotkey();
+        a.update_keyboard_hook();
+        if let Some(e) = config_error {
+            a.balloon("설정 파일 오류 — 기본 설정으로 시작합니다", &e, true);
+        }
+        // 다른 PC 와 동기화(설정했을 때만): 시작할 때 한 번, 그 뒤 1분마다
+        a.sync_pull();
+        SetTimer(main, TIMER_SYNC, 60_000, None);
+        manager::screenshot_test(a);
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            // 설정 창의 Tab/Enter/Esc
+            let dlg = settings::dialog_hwnd();
+            if !dlg.is_null() && IsDialogMessageW(dlg, &msg) != 0 {
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        app().shutdown();
+    }
+}
+
+impl App {
+    fn config_path(&self) -> PathBuf {
+        self.data_dir.join(storage::CONFIG_FILE)
+    }
+
+    fn register_hotkey(&mut self) {
+        unsafe {
+            if self.hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_ID);
+                self.hotkey_ok = false;
+            }
+            if self.capture_hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_CAPTURE);
+                self.capture_hotkey_ok = false;
+            }
+            if self.manager_hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_MANAGER);
+                self.manager_hotkey_ok = false;
+            }
+        }
+        let main_hk = self.config.hotkey.clone();
+        let cap_hk = self.config.capture_hotkey.clone();
+        self.hotkey_ok = self.register_one(HOTKEY_ID, &main_hk, "hotkey");
+        self.capture_hotkey_ok = self.register_one(HOTKEY_CAPTURE, &cap_hk, "capture_hotkey");
+        let mgr_hk = self.config.manager_hotkey.clone();
+        self.manager_hotkey_ok = self.register_one(HOTKEY_MANAGER, &mgr_hk, "manager_hotkey");
+        self.tray(NIM_MODIFY);
+    }
+
+    fn register_one(&mut self, id: i32, text: &str, key_name: &str) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        match hotkey::parse(text) {
+            Ok(hk) => {
+                let mods = hk.modifiers as HOT_KEY_MODIFIERS | MOD_NOREPEAT;
+                let ok = unsafe { RegisterHotKey(self.main, id, mods, hk.vk) } != 0;
+                if !ok {
+                    self.balloon(
+                        "단축키를 등록하지 못했습니다",
+                        &format!(
+                            "{} 는 다른 프로그램이 이미 쓰고 있습니다. 트레이 메뉴 → 설정 파일 열기에서 {} 를 바꿔주세요.",
+                            text, key_name
+                        ),
+                        true,
+                    );
+                }
+                ok
+            }
+            Err(e) => {
+                self.balloon("단축키 설정 오류", &format!("{}: {}", key_name, e), true);
+                false
+            }
+        }
+    }
+
+    /// "Ctrl+C 두 번" 감지용 키보드 훅을 설정에 맞게 켜고 끕니다.
+    /// 키를 가로채지는 않으므로 평소 복사는 그대로 동작합니다.
+    fn update_keyboard_hook(&mut self) {
+        DOUBLE_COPY_MS.store(self.config.double_copy_ms, Ordering::Relaxed);
+        QUEUE_LEN.store(self.queue.len(), Ordering::Relaxed);
+        let need = self.config.double_copy_ms > 0 || self.queue_on || !self.queue.is_empty();
+        unsafe {
+            if need && self.kb_hook.is_null() {
+                self.kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), self.hinst, 0);
+                if self.kb_hook.is_null() {
+                    self.balloon(
+                        "Ctrl+C 두 번 감지를 켜지 못했습니다",
+                        &format!("{} 로 팝업을 열어 주세요.", self.config.hotkey),
+                        true,
+                    );
+                }
+            } else if !need && !self.kb_hook.is_null() {
+                UnhookWindowsHookEx(self.kb_hook);
+                self.kb_hook = null_mut();
+            }
+        }
+    }
+
+    fn tray_data(&self) -> NOTIFYICONDATAW {
+        let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.main;
+        nid.uID = 1;
+        nid
+    }
+
+    pub fn tray(&self, op: NOTIFY_ICON_MESSAGE) {
+        let mut nid = self.tray_data();
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        nid.uCallbackMessage = WM_APP_TRAY;
+        nid.hIcon = if self.paused { self.icon_paused } else { self.icon_normal };
+        let tip = if self.paused {
+            "ClipStash — 기록 일시정지됨".to_string()
+        } else if self.queue_on || !self.queue.is_empty() {
+            format!("ClipStash — 순차 붙여넣기 {}개 남음\nCtrl+V 마다 다음 항목", self.queue.len())
+        } else {
+            format!("ClipStash — 기록 {}개\n{} 로 열기", self.history.items.len(), self.config.shortcut_label())
+        };
+        util::copy_to_buf(&mut nid.szTip, &tip);
+        unsafe {
+            Shell_NotifyIconW(op, &nid);
+            if op == NIM_ADD {
+                nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+                Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            }
+        }
+    }
+
+    pub fn balloon(&self, title: &str, text: &str, warn: bool) {
+        let mut nid = self.tray_data();
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = if warn { NIIF_WARNING } else { NIIF_INFO };
+        util::copy_to_buf(&mut nid.szInfoTitle, title);
+        util::copy_to_buf(&mut nid.szInfo, text);
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+    }
+
+    /// 기록이 바뀌었음 → 잠시 뒤에 한꺼번에 저장
+    pub fn mark_dirty(&mut self) {
+        unsafe { SetTimer(self.main, TIMER_SAVE, 1500, None) };
+        self.tray(NIM_MODIFY);
+    }
+
+    fn save_now(&mut self) {
+        unsafe { KillTimer(self.main, TIMER_SAVE) };
+        if let Err(e) = storage::save_history(&self.data_dir, &self.history) {
+            self.balloon("기록을 저장하지 못했습니다", &e.to_string(), true);
+        }
+        self.sync_push();
+    }
+
+    fn shutdown(&mut self) {
+        self.save_now();
+        unsafe {
+            RemoveClipboardFormatListener(self.main);
+            if self.hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_ID);
+            }
+            if self.capture_hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_CAPTURE);
+            }
+            if self.manager_hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_MANAGER);
+            }
+            if !self.kb_hook.is_null() {
+                UnhookWindowsHookEx(self.kb_hook);
+            }
+            let nid = self.tray_data();
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
+    }
+
+    /// 설정 파일이 바뀌었으면(또는 force) 다시 읽습니다.
+    pub fn reload_config(&mut self, force: bool) {
+        let path = self.config_path();
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if !force && mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => {
+                // 지워졌으면 기본 파일을 다시 만들어 둡니다.
+                let _ = std::fs::write(&path, DEFAULT_CONFIG_TOML);
+                DEFAULT_CONFIG_TOML.to_string()
+            }
+        };
+        match Config::from_toml(&text) {
+            Ok(c) => {
+                let hotkey_changed = c.hotkey != self.config.hotkey
+                    || c.capture_hotkey != self.config.capture_hotkey
+                    || c.manager_hotkey != self.config.manager_hotkey;
+                let sync_changed = c.sync_folder != self.config.sync_folder;
+                self.config = c;
+                if sync_changed {
+                    self.sync_seen.clear();
+                    self.sync_warned = false;
+                    self.sync_pull();
+                    self.sync_push();
+                }
+                if hotkey_changed || !self.hotkey_ok {
+                    self.register_hotkey();
+                }
+                self.update_keyboard_hook();
+                let evicted = self.history.trim(self.config.max_items);
+                if !evicted.is_empty() {
+                    storage::delete_item_files(&self.data_dir, &evicted);
+                    self.mark_dirty();
+                }
+                popup::on_config_changed(self);
+                if force {
+                    self.balloon("설정을 다시 불러왔습니다", &format!("팝업 열기: {}", self.config.shortcut_label()), false);
+                }
+            }
+            Err(e) => self.balloon("설정 파일 오류 — 이전 설정을 유지합니다", &e, true),
+        }
+    }
+
+    pub fn open_config_file(&self) {
+        util::shell_open("notepad.exe", Some(&format!("\"{}\"", self.config_path().display())));
+    }
+
+    /// 텍스트 항목을 템플릿으로 설정 파일 끝에 추가합니다(주석은 그대로 둡니다).
+    pub fn save_as_template(&mut self, id: u64) {
+        let Some(text) = self.history.get(id).and_then(|i| i.content.as_plain_text()) else { return };
+        let name: String = clipstash::history::one_line(&text, 24);
+        let t = Template { name, group: Some("내 템플릿".into()), text };
+        match self.append_templates(std::slice::from_ref(&t)) {
+            Ok(()) => self.balloon(
+                "템플릿으로 저장했습니다",
+                &format!("\"{}\" — 팝업의 템플릿 탭에서 볼 수 있습니다.", t.name),
+                false,
+            ),
+            Err(e) => self.balloon("템플릿을 저장하지 못했습니다", &e, true),
+        }
+    }
+
+    /// 템플릿들을 설정 파일 끝에 덧붙이고 다시 읽습니다.
+    pub fn append_templates(&mut self, list: &[Template]) -> Result<(), String> {
+        let path = self.config_path();
+        let mut cur = std::fs::read_to_string(&path).unwrap_or_default();
+        for t in list {
+            let body = toml::to_string(t).map_err(|e| e.to_string())?;
+            if !cur.ends_with('\n') {
+                cur.push('\n');
+            }
+            cur.push_str("\n[[templates]]\n");
+            cur.push_str(&body);
+        }
+        storage::write_atomic(&path, cur.as_bytes()).map_err(|e| e.to_string())?;
+        self.reload_config(true);
+        Ok(())
+    }
+
+    fn on_clipboard_update(&mut self) {
+        if self.paused {
+            return;
+        }
+        // 어느 프로그램이 복사했는지(클립보드 소유 창 → 없으면 지금 앞에 있는 창)
+        let owner = unsafe { GetClipboardOwner() };
+        if util::is_own_window(owner) {
+            return;
+        }
+        let source = util::process_name_of_window(owner)
+            .or_else(|| util::process_name_of_window(unsafe { GetForegroundWindow() }));
+        if let Some(s) = &source {
+            if self.config.is_excluded(s) {
+                return;
+            }
+        }
+        let opt = clip::ReadOptions {
+            text: self.config.capture_text,
+            images: self.config.capture_images,
+            files: self.config.capture_files,
+            html: self.config.keep_html,
+            max_text_bytes: self.config.max_text_kb * 1024,
+            max_image_bytes: self.config.max_image_mb * 1024 * 1024,
+        };
+        let captured = match clip::read(self.main, &self.formats, &opt) {
+            clip::ReadResult::Got(c) => c,
+            _ => return,
+        };
+        let mut captured_dib = None;
+        let (content, h) = match captured {
+            clip::Captured::Text { text, html } => {
+                if text.is_empty() || (self.config.ignore_whitespace_only && text.trim().is_empty()) {
+                    return;
+                }
+                let h = hash::content_hash("text", text.as_bytes());
+                (ClipContent::Text { text, html }, h)
+            }
+            clip::Captured::Files { paths } => {
+                let h = hash::content_hash("files", paths.join("\n").as_bytes());
+                (ClipContent::Files { paths }, h)
+            }
+            clip::Captured::Image { dib } => {
+                let Some((content, h)) = self.store_image(&dib) else { return };
+                captured_dib = Some(dib);
+                (content, h)
+            }
+        };
+        self.add_entry(content, h, source, captured_dib.as_deref());
+    }
+
+    /// 이미지를 데이터 폴더에 BMP 로 저장하고 기록용 내용을 만듭니다.
+    fn store_image(&mut self, dib: &[u8]) -> Option<(ClipContent, String)> {
+        let h = hash::content_hash("image", dib);
+        let (width, height) = bmp::dib_size(dib)?;
+        let file = format!("{}.bmp", h);
+        let path = storage::image_path(&self.data_dir, &file);
+        if !path.exists() {
+            let data = bmp::dib_to_bmp(dib)?;
+            storage::write_atomic(&path, &data).ok()?;
+        }
+        Some((ClipContent::Image { file, width, height }, h))
+    }
+
+    /// 기록에 넣고(순차 붙여넣기 모드면 대기열에도) 저장 예약
+    fn add_entry(&mut self, content: ClipContent, h: String, source: Option<String>, dib: Option<&[u8]>) -> u64 {
+        let out = self.history.add(content, h, source, util::now_unix(), self.config.max_items);
+        if let Some(dib) = dib {
+            popup::cache_thumbnail(self, out.id, dib);
+        }
+        storage::delete_item_files(&self.data_dir, &out.evicted);
+        if self.queue_on {
+            self.queue.push_back(out.id);
+            QUEUE_LEN.store(self.queue.len(), Ordering::Relaxed);
+        }
+        self.mark_dirty();
+        popup::on_history_changed(self);
+        out.id
+    }
+
+    /// 화면 캡처 결과: 기록에 넣고 클립보드에도 넣습니다.
+    pub fn add_screen_capture(&mut self, dib: Vec<u8>, ocr: bool) {
+        let Some((content, h)) = self.store_image(&dib) else {
+            self.balloon("캡처를 저장하지 못했습니다", "데이터 폴더에 쓸 수 없습니다.", true);
+            return;
+        };
+        let (w, hgt) = bmp::dib_size(&dib).unwrap_or((0, 0));
+        self.add_entry(content, h, Some("화면 캡처".into()), Some(&dib));
+        let copied = clip::write(self.main, &self.formats, clip::Payload::Image { dib: &dib });
+        if ocr {
+            self.ocr_dib(&dib);
+        } else {
+            self.balloon(
+                "화면을 캡처했습니다",
+                &format!(
+                    "{}×{} — 기록에 넣었습니다{}",
+                    w,
+                    hgt,
+                    if copied { ". 바로 Ctrl+V 로 붙여넣을 수 있어요." } else { "." }
+                ),
+                false,
+            );
+        }
+    }
+
+    /// 이미지 항목에서 글자 추출(결과는 새 텍스트 항목 + 클립보드)
+    pub fn ocr_item(&mut self, id: u64, windows_only: bool) {
+        let Some(ClipContent::Image { file, .. }) = self.history.get(id).map(|i| i.content.clone()) else { return };
+        popup::hide(self);
+        let data = std::fs::read(storage::image_path(&self.data_dir, &file)).unwrap_or_default();
+        match bmp::bmp_to_dib(&data) {
+            Some(dib) => self.ocr_dib_with(dib, windows_only),
+            None => self.balloon("이미지를 읽지 못했습니다", "파일이 지워졌을 수 있습니다.", true),
+        }
+    }
+
+    fn ocr_dib(&mut self, dib: &[u8]) {
+        self.ocr_dib_with(dib, false);
+    }
+
+    /// `windows_only` 이면 AI 키가 있어도 Windows 내장 OCR 만 씁니다(Shift+O).
+    pub fn ocr_dib_with(&mut self, dib: &[u8], windows_only: bool) {
+        let Some((w, h, px)) = ocr::dib_to_bgra(dib, ocr::MAX_SIDE) else {
+            self.balloon("글자 추출 실패", "이미지 형식을 읽지 못했습니다.", true);
+            return;
+        };
+        let key = self.ai_key();
+        let ai = match key {
+            Some(k) if !windows_only => ocr::dib_to_png_for_ai(dib).map(|png| (k, png)),
+            _ => None,
+        };
+        let model = self.config.ai_ocr_model.trim().to_string();
+        if ai.is_some() {
+            self.balloon("AI 로 글자를 읽는 중…", "보통 몇 초~수십 초 걸립니다. 끝나면 클립보드에 복사됩니다.", false);
+        }
+        worker::spawn(self.main, move || {
+            let win = |note: &str| ocr::recognize(w, h, px).map(|t| (t, note.to_string()));
+            worker::Done::Ocr(match ai {
+                Some((key, png)) => match ocr::recognize_ai(&key, &model, &png) {
+                    Ok(t) => Ok((t, format!("AI({})", model))),
+                    Err(e) => win(&format!("AI 실패 → Windows OCR 로 대신함: {}", e)).map_err(|e2| format!("{}\n(AI 도 실패: {})", e2, e)),
+                },
+                None => win("Windows OCR"),
+            })
+        });
+    }
+
+    /// AI 글자 추출용 키(설정 → 없으면 환경 변수 ANTHROPIC_API_KEY)
+    fn ai_key(&self) -> Option<String> {
+        let k = self.config.anthropic_api_key.trim();
+        if !k.is_empty() {
+            return Some(k.to_string());
+        }
+        std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty())
+    }
+
+    /// 편집한 글을 붙여넣고 기록에도 남깁니다.
+    pub fn paste_edited(&mut self, text: String) {
+        if text.trim().is_empty() {
+            popup::hide(self);
+            return;
+        }
+        let h = hash::content_hash("text", text.as_bytes());
+        self.add_entry(ClipContent::text(text.clone()), h, Some("편집".into()), None);
+        if !clip::write(self.main, &self.formats, clip::Payload::Text { text: &text, html: None }) {
+            popup::hide(self);
+            self.balloon("클립보드에 넣지 못했습니다", "잠시 뒤 다시 해 보세요.", true);
+            return;
+        }
+        self.finish_paste(false, None);
+    }
+
+    // ── 순차 붙여넣기 ─────────────────────────────────────────
+
+    /// 모드 켜기/끄기. 켜면 그 뒤로 복사한 것이 차례로 쌓입니다.
+    pub fn toggle_queue(&mut self) {
+        if self.queue_on || !self.queue.is_empty() {
+            self.stop_queue(true);
+        } else {
+            self.queue_on = true;
+            self.queue_auto_off = false;
+            self.queue.clear();
+            self.update_keyboard_hook();
+            self.tray(NIM_MODIFY);
+            self.balloon(
+                "순차 붙여넣기 켜짐",
+                "여러 번 복사한 뒤 Ctrl+V 를 누를 때마다 복사한 순서대로 하나씩 붙여넣습니다. 끄려면 트레이 메뉴나 팝업에서 Q.",
+                false,
+            );
+        }
+        popup::on_history_changed(self);
+    }
+
+    /// 팝업에서 고른 항목들을 고른 순서대로 대기열에 넣습니다.
+    pub fn start_queue_with(&mut self, ids: &[u64]) {
+        popup::hide(self);
+        self.queue = ids.iter().copied().collect();
+        self.queue_on = true;
+        self.queue_auto_off = true;
+        self.update_keyboard_hook();
+        self.tray(NIM_MODIFY);
+        self.balloon(
+            &format!("순차 붙여넣기: {}개 준비됨", ids.len()),
+            "붙여넣을 곳에서 Ctrl+V 를 누를 때마다 고른 순서대로 하나씩 들어갑니다.",
+            false,
+        );
+    }
+
+    fn stop_queue(&mut self, announce: bool) {
+        let left = self.queue.len();
+        self.queue.clear();
+        self.queue_on = false;
+        self.queue_auto_off = false;
+        self.update_keyboard_hook();
+        self.tray(NIM_MODIFY);
+        if announce {
+            let msg = if left > 0 { format!("남은 {}개는 붙여넣지 않았습니다.", left) } else { "Ctrl+V 가 다시 평소처럼 동작합니다.".into() };
+            self.balloon("순차 붙여넣기 꺼짐", &msg, false);
+        }
+    }
+
+    /// 키보드 훅이 가로챈 Ctrl+V: 대기열 맨 앞 항목을 클립보드에 넣고 붙여넣습니다.
+    fn queue_paste_next(&mut self) {
+        let target = unsafe { GetForegroundWindow() };
+        while let Some(id) = self.queue.pop_front() {
+            QUEUE_LEN.store(self.queue.len(), Ordering::Relaxed);
+            if self.history.get(id).is_none() {
+                continue;
+            }
+            if self.write_item(id, false) {
+                self.history.mark_used(id, util::now_unix(), false);
+                self.mark_dirty();
+            }
+            let shift_insert = util::process_name_of_window(target)
+                .map(|p| self.config.uses_shift_insert(&p))
+                .unwrap_or(false);
+            paste::queue_paste(shift_insert);
+            break;
+        }
+        if self.queue.is_empty() {
+            if self.queue_auto_off {
+                self.stop_queue(false);
+                self.balloon("순차 붙여넣기 끝", "고른 항목을 모두 붙여넣었습니다.", false);
+            } else {
+                self.update_keyboard_hook();
+            }
+        }
+        self.tray(NIM_MODIFY);
+        popup::on_history_changed(self);
+    }
+
+    // ── 카카오톡 나에게 보내기 ─────────────────────────────────
+
+    pub fn kakao_connected(&self) -> bool {
+        kakao::load_token(&self.data_dir).is_some()
+    }
+
+    fn kakao_key_missing(&self) -> bool {
+        if !self.config.kakao_rest_api_key.trim().is_empty() {
+            return false;
+        }
+        let r = util::message_box(
+            self.main,
+            "카카오톡으로 보내려면 카카오 개발자 사이트에서 받은 REST API 키가 필요합니다.\n\n\
+             1. developers.kakao.com 에서 앱 만들기\n\
+             2. 카카오 로그인 켜기, Redirect URI 에 http://localhost:8765 등록\n\
+             3. 동의항목에서 \"카카오톡 메시지 전송\" 켜기\n\
+             4. 설정 파일의 kakao_rest_api_key 에 REST API 키 넣기\n\n\
+             자세한 방법은 README 에 있습니다. 지금 설정 파일을 열까요?",
+            MB_YESNO | MB_ICONINFORMATION,
+        );
+        if r == IDYES {
+            self.open_config_file();
+        }
+        true
+    }
+
+    /// 브라우저로 카카오 로그인 → 토큰 저장
+    pub fn kakao_connect(&mut self) {
+        if self.kakao_key_missing() || self.kakao_busy {
+            return;
+        }
+        let port = self.config.kakao_port;
+        let listener = match kakao::listen(port) {
+            Ok(l) => l,
+            Err(e) => {
+                self.balloon("카카오톡 연결 실패", &e, true);
+                return;
+            }
+        };
+        let key = self.config.kakao_rest_api_key.trim().to_string();
+        let secret = self.config.kakao_client_secret.trim().to_string();
+        util::shell_open(&clipstash::kakao::authorize_url(&key, port), None);
+        self.kakao_busy = true;
+        self.balloon("카카오 로그인 창을 열었습니다", "브라우저에서 로그인하고 동의하면 연결됩니다.", false);
+        worker::spawn(self.main, move || worker::Done::KakaoAuth(kakao::finish_login(listener, &key, &secret, port)));
+    }
+
+    fn kakao_disconnect(&mut self) {
+        let _ = std::fs::remove_file(kakao::token_path(&self.data_dir));
+        self.balloon("카카오톡 연결을 해제했습니다", "다시 쓰려면 트레이 메뉴에서 연결하세요.", false);
+    }
+
+    /// 항목(여러 개면 이어 붙여서)을 카카오톡 나와의 채팅으로 보냅니다.
+    pub fn send_to_kakao(&mut self, ids: &[u64]) {
+        popup::hide(self);
+        if self.kakao_key_missing() {
+            return;
+        }
+        let Some(token) = kakao::load_token(&self.data_dir) else {
+            let r = util::message_box(
+                self.main,
+                "아직 카카오톡에 연결하지 않았습니다. 지금 연결할까요?\n(브라우저에서 카카오 로그인 화면이 열립니다)",
+                MB_YESNO | MB_ICONQUESTION,
+            );
+            if r == IDYES {
+                self.kakao_connect();
+            }
+            return;
+        };
+        if self.kakao_busy {
+            self.balloon("잠시만요", "카카오톡으로 보내는 중입니다.", false);
+            return;
+        }
+        let Some(text) = self.history.merge_text(ids, &self.config.merge_separator) else {
+            self.balloon("보낼 글이 없습니다", "이미지는 카카오톡으로 보낼 수 없습니다. 글자 추출(O)한 뒤 보내 보세요.", false);
+            return;
+        };
+        let (parts, truncated) = clipstash::kakao::split_text(&text);
+        if parts.is_empty() {
+            return;
+        }
+        let key = self.config.kakao_rest_api_key.trim().to_string();
+        let secret = self.config.kakao_client_secret.trim().to_string();
+        self.kakao_busy = true;
+        worker::spawn(self.main, move || {
+            let (result, token) = kakao::send(&key, &secret, token, &parts);
+            worker::Done::KakaoSent { result, token, truncated }
+        });
+    }
+
+    fn on_worker_done(&mut self) {
+        for d in worker::take() {
+            match d {
+                worker::Done::Ocr(Ok((text, how))) => {
+                    let h = hash::content_hash("text", text.as_bytes());
+                    let lines = text.lines().count();
+                    let preview = clipstash::history::one_line(&text, 60);
+                    self.add_entry(ClipContent::text(text.clone()), h, Some("글자 추출".into()), None);
+                    clip::write(self.main, &self.formats, clip::Payload::Text { text: &text, html: None });
+                    let warn = how.starts_with("AI 실패");
+                    self.balloon(
+                        &format!("글자를 추출했습니다 ({}줄)", lines),
+                        &format!("{}\n클립보드에 복사됨: {}", how, preview),
+                        warn,
+                    );
+                }
+                worker::Done::Ocr(Err(e)) => self.balloon("글자 추출 실패", &e, true),
+                worker::Done::KakaoAuth(r) => {
+                    self.kakao_busy = false;
+                    match r.and_then(|t| kakao::save_token(&self.data_dir, &t).map_err(|e| e.to_string())) {
+                        Ok(()) => self.balloon("카카오톡 연결 완료", "팝업에서 항목을 고르고 K 를 누르면 나에게 보냅니다.", false),
+                        Err(e) => self.balloon("카카오톡 연결 실패", &e, true),
+                    }
+                }
+                worker::Done::KakaoSent { result, token, truncated } => {
+                    self.kakao_busy = false;
+                    if let Some(t) = token {
+                        let _ = kakao::save_token(&self.data_dir, &t);
+                    }
+                    match result {
+                        Ok(n) => {
+                            let mut msg = if n > 1 { format!("긴 글이라 {}개로 나눠 보냈습니다.", n) } else { "카카오톡 \"나와의 채팅\"을 확인하세요.".into() };
+                            if truncated {
+                                msg.push_str(" (너무 길어서 뒷부분은 잘렸습니다)");
+                            }
+                            self.balloon("카카오톡으로 보냈습니다", &msg, false);
+                        }
+                        Err(e) => self.balloon("카카오톡으로 보내지 못했습니다", &e, true),
+                    }
+                }
+            }
+        }
+    }
+
+    /// 기록 항목을 클립보드에 넣습니다. `plain` 이면 서식 없이.
+    fn write_item(&mut self, id: u64, plain: bool) -> bool {
+        let Some(item) = self.history.get(id).cloned() else { return false };
+        let plain = plain || self.config.plain_text_by_default;
+        match &item.content {
+            ClipContent::Image { file, .. } => {
+                let data = std::fs::read(storage::image_path(&self.data_dir, file)).ok();
+                match data.as_deref().and_then(bmp::bmp_to_dib) {
+                    Some(dib) => clip::write(self.main, &self.formats, clip::Payload::Image { dib }),
+                    None => false,
+                }
+            }
+            ClipContent::Text { text, html } => clip::write(
+                self.main,
+                &self.formats,
+                clip::Payload::Text { text, html: if plain { None } else { html.as_deref() } },
+            ),
+            ClipContent::Files { paths } if plain => {
+                let s = paths.join("\r\n");
+                clip::write(self.main, &self.formats, clip::Payload::Text { text: &s, html: None })
+            }
+            ClipContent::Files { paths } => clip::write(self.main, &self.formats, clip::Payload::Files { paths }),
+        }
+    }
+
+    /// 기록 항목을 클립보드에 넣고(필요하면) 붙여넣기
+    pub fn use_clip(&mut self, id: u64, action: Action) {
+        let ok = match action {
+            Action::Transform(t) => match self.history.get(id).and_then(|i| i.content.as_plain_text()) {
+                Some(text) => {
+                    let s = t.apply(&text);
+                    clip::write(self.main, &self.formats, clip::Payload::Text { text: &s, html: None })
+                }
+                None => self.write_item(id, false),
+            },
+            _ => self.write_item(id, action == Action::PastePlain),
+        };
+        if !ok {
+            popup::hide(self);
+            self.balloon(
+                "클립보드에 넣지 못했습니다",
+                "다른 프로그램이 클립보드를 쓰고 있을 수 있습니다. 잠시 뒤 다시 해 보세요.",
+                true,
+            );
+            return;
+        }
+        self.history.mark_used(id, util::now_unix(), self.config.move_to_top_on_paste);
+        self.mark_dirty();
+        self.finish_paste(action == Action::CopyOnly, None);
+    }
+
+    /// 여러 항목을 체크한 순서대로 이어 붙여서 한 번에 붙여넣기
+    pub fn use_many(&mut self, ids: &[u64], action: Action) {
+        let Some(mut text) = self.history.merge_text(ids, &self.config.merge_separator) else {
+            popup::hide(self);
+            self.balloon("붙여넣을 텍스트가 없습니다", "이미지는 여러 개를 한 번에 붙여넣을 수 없습니다.", false);
+            return;
+        };
+        if let Action::Transform(t) = action {
+            text = t.apply(&text);
+        }
+        if !clip::write(self.main, &self.formats, clip::Payload::Text { text: &text, html: None }) {
+            popup::hide(self);
+            self.balloon("클립보드에 넣지 못했습니다", "잠시 뒤 다시 해 보세요.", true);
+            return;
+        }
+        let now = util::now_unix();
+        for id in ids {
+            self.history.mark_used(*id, now, false);
+        }
+        self.mark_dirty();
+        self.finish_paste(action == Action::CopyOnly, None);
+    }
+
+    /// 템플릿을 펼쳐서 붙여넣기
+    pub fn use_template(&mut self, index: usize, action: Action) {
+        let Some(t) = self.config.templates.get(index).cloned() else { return };
+        let clipboard = if t.text.contains("{clipboard}") { clip::read_text(self.main) } else { None };
+        let ctx = template::Context { now: util::local_time(), clipboard: clipboard.as_deref() };
+        let mut ex = template::expand(&t.text, &ctx);
+        if let Action::Transform(tr) = action {
+            ex.text = tr.apply(&ex.text);
+            ex.cursor_back = None;
+        }
+        if !clip::write(self.main, &self.formats, clip::Payload::Text { text: &ex.text, html: None }) {
+            popup::hide(self);
+            self.balloon("클립보드에 넣지 못했습니다", "잠시 뒤 다시 해 보세요.", true);
+            return;
+        }
+        self.finish_paste(action == Action::CopyOnly, ex.cursor_back);
+    }
+
+    fn finish_paste(&mut self, copy_only: bool, cursor_back: Option<usize>) {
+        let target = self.popup.target;
+        popup::hide(self);
+        if copy_only || !self.config.paste_after_select || target.is_null() {
+            return;
+        }
+        if paste::focus(target) {
+            let shift_insert = util::process_name_of_window(target)
+                .map(|p| self.config.uses_shift_insert(&p))
+                .unwrap_or(false);
+            paste::send_paste(shift_insert, cursor_back);
+        }
+    }
+
+    pub fn delete_clip(&mut self, id: u64) {
+        if let Some(item) = self.history.remove(id) {
+            storage::delete_item_files(&self.data_dir, &[item]);
+            self.mark_dirty();
+            popup::on_history_changed(self);
+        }
+    }
+
+    pub fn toggle_pin(&mut self, id: u64) {
+        if self.history.toggle_pin(id).is_some() {
+            self.mark_dirty();
+            popup::on_history_changed(self);
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.tray(NIM_MODIFY);
+        popup::on_history_changed(self);
+    }
+
+    fn show_tray_menu(&mut self) {
+        unsafe {
+            let m = CreatePopupMenu();
+            let add = |flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
+                let t = wide(text);
+                AppendMenuW(m, flags, id, t.as_ptr());
+            };
+            let checked = |b: bool| if b { MF_CHECKED } else { MF_UNCHECKED };
+            let mgr = if self.config.manager_hotkey.trim().is_empty() {
+                "클립보드 매니저 열기".to_string()
+            } else {
+                format!("클립보드 매니저 열기\t{}", self.config.manager_hotkey)
+            };
+            add(MF_STRING, CMD_MANAGER, &mgr);
+            add(MF_STRING, CMD_OPEN, &format!("빠른 팝업 열기\t{}", self.config.shortcut_label()));
+            let cap = if self.config.capture_hotkey.trim().is_empty() {
+                "화면 캡처".to_string()
+            } else {
+                format!("화면 캡처\t{}", self.config.capture_hotkey)
+            };
+            add(MF_STRING, CMD_CAPTURE, &cap);
+            add(MF_STRING, CMD_CAPTURE_OCR, "화면 캡처해서 글자 추출");
+            let q = if self.queue_on || !self.queue.is_empty() {
+                format!("순차 붙여넣기 ({}개 남음)", self.queue.len())
+            } else {
+                "순차 붙여넣기 (Ctrl+V 마다 다음 항목)".to_string()
+            };
+            add(MF_STRING | checked(self.queue_on || !self.queue.is_empty()), CMD_QUEUE, &q);
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING | checked(self.paused), CMD_PAUSE, "기록 일시정지");
+            add(MF_STRING | checked(util::autostart_enabled()), CMD_AUTOSTART, "Windows 시작 시 자동 실행");
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING, CMD_SETTINGS, "설정…");
+            add(MF_STRING, CMD_EDIT_CONFIG, "설정 파일 직접 열기 (템플릿·제외 프로그램)");
+            add(MF_STRING, CMD_RELOAD, "설정 다시 불러오기");
+            add(MF_STRING, CMD_DATA_DIR, "데이터 폴더 열기");
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING, CMD_EXPORT, "기록 백업 파일로 내보내기…");
+            add(MF_STRING, CMD_IMPORT, "백업 파일에서 가져오기…");
+            if !self.config.sync_folder.trim().is_empty() {
+                add(MF_STRING, CMD_SYNC_NOW, "지금 동기화");
+            }
+            if self.kakao_connected() {
+                add(MF_STRING, CMD_KAKAO_OFF, "카카오톡 연결 해제");
+            } else {
+                add(MF_STRING, CMD_KAKAO, "카카오톡 나에게 보내기 연결…");
+            }
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING, CMD_CLEAR, "고정하지 않은 기록 모두 지우기…");
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING, CMD_ABOUT, "ClipStash 정보");
+            add(MF_STRING, CMD_EXIT, "종료");
+            SetMenuDefaultItem(m, CMD_MANAGER as u32, 0);
+
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            // 메뉴 밖을 누르면 닫히도록 하는 Windows 의 오래된 요령
+            SetForegroundWindow(self.main);
+            let cmd = TrackPopupMenu(
+                m,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x,
+                pt.y,
+                0,
+                self.main,
+                null(),
+            ) as usize;
+            PostMessageW(self.main, WM_NULL, 0, 0);
+            DestroyMenu(m);
+            self.run_tray_command(cmd);
+        }
+    }
+
+    fn run_tray_command(&mut self, cmd: usize) {
+        match cmd {
+            CMD_OPEN => popup::show(self, null_mut(), true),
+            CMD_CAPTURE => capture::start(self, false),
+            CMD_CAPTURE_OCR => capture::start(self, true),
+            CMD_QUEUE => self.toggle_queue(),
+            CMD_EXPORT => self.export_backup(),
+            CMD_IMPORT => self.import_backup(),
+            CMD_SYNC_NOW => {
+                self.sync_seen.clear();
+                self.sync_pull();
+                self.save_now();
+                self.balloon("동기화했습니다", &self.config.sync_folder.clone(), false);
+            }
+            CMD_KAKAO => self.kakao_connect(),
+            CMD_KAKAO_OFF => self.kakao_disconnect(),
+            CMD_PAUSE => self.set_paused(!self.paused),
+            CMD_AUTOSTART => {
+                let want = !util::autostart_enabled();
+                if !util::set_autostart(want) {
+                    self.balloon("자동 실행 설정을 바꾸지 못했습니다", "레지스트리에 쓸 수 없습니다.", true);
+                }
+            }
+            CMD_SETTINGS => settings::open(self),
+            CMD_MANAGER => manager::open(self),
+            CMD_EDIT_CONFIG => self.open_config_file(),
+            CMD_RELOAD => self.reload_config(true),
+            CMD_DATA_DIR => util::shell_open(&self.data_dir.display().to_string(), None),
+            CMD_CLEAR => {
+                let n = self.history.items.iter().filter(|i| !i.pinned).count();
+                let r = util::message_box(
+                    self.main,
+                    &format!("고정하지 않은 기록 {}개를 모두 지울까요?\n고정한 항목은 남습니다.", n),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                );
+                if r == IDYES {
+                    let gone = self.history.clear_unpinned();
+                    storage::delete_item_files(&self.data_dir, &gone);
+                    self.mark_dirty();
+                    popup::on_history_changed(self);
+                }
+            }
+            CMD_ABOUT => {
+                util::message_box(
+                    self.main,
+                    &format!(
+                        "ClipStash {}\n가벼운 클립보드 기록 관리자\n\n팝업 열기: {}\n데이터 폴더: {}",
+                        env!("CARGO_PKG_VERSION"),
+                        self.config.shortcut_label(),
+                        self.data_dir.display()
+                    ),
+                    MB_ICONINFORMATION,
+                );
+            }
+            CMD_EXIT => unsafe {
+                DestroyWindow(self.main);
+            },
+            _ => {}
+        }
+    }
+}
+
+unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let a = APP.load(Ordering::Relaxed);
+    if a.is_null() {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    let a = &mut *a;
+    match msg {
+        WM_CLIPBOARDUPDATE => {
+            a.on_clipboard_update();
+            0
+        }
+        WM_HOTKEY if wp as i32 == HOTKEY_ID => {
+            if a.popup.visible() {
+                popup::hide(a);
+            } else {
+                popup::show(a, GetForegroundWindow(), false);
+            }
+            0
+        }
+        WM_HOTKEY if wp as i32 == HOTKEY_MANAGER => {
+            manager::toggle(a);
+            0
+        }
+        WM_HOTKEY if wp as i32 == HOTKEY_CAPTURE => {
+            capture::start(a, false);
+            0
+        }
+        WM_APP_QUEUE_PASTE => {
+            a.queue_paste_next();
+            0
+        }
+        worker::WM_APP_WORKER => {
+            a.on_worker_done();
+            0
+        }
+        WM_TIMER if wp == TIMER_SYNC => {
+            a.sync_pull();
+            0
+        }
+        WM_APP_DOUBLE_COPY => {
+            if !a.popup.visible() {
+                popup::show(a, GetForegroundWindow(), false);
+            }
+            0
+        }
+        WM_APP_SHOW => {
+            popup::show(a, null_mut(), true);
+            0
+        }
+        WM_APP_TRAY => {
+            // NOTIFYICON_VERSION_4: LOWORD(lParam) 가 이벤트
+            match (lp as u32) & 0xFFFF {
+                // 왼쪽 클릭/키보드 선택 → 팝업, 오른쪽 클릭 → 메뉴
+                TRAY_SELECT | TRAY_KEYSELECT => manager::open(a),
+                WM_CONTEXTMENU => a.show_tray_menu(),
+                _ => {}
+            }
+            0
+        }
+        WM_TIMER if wp == TIMER_SAVE => {
+            a.save_now();
+            0
+        }
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION => {
+            if wp != 0 {
+                a.save_now();
+            }
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ if msg == a.taskbar_created && msg != 0 => {
+            // 탐색기가 다시 시작되면 트레이 아이콘을 다시 올립니다.
+            a.tray(NIM_ADD);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+// ── Ctrl+C 두 번 감지 ─────────────────────────────────────────
+
+static DOUBLE_COPY_MS: AtomicU32 = AtomicU32::new(0);
+static C_HELD: AtomicBool = AtomicBool::new(false);
+/// 순차 붙여넣기 대기열 길이(훅에서 읽음)
+static QUEUE_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Ctrl+V 를 가로채는 중(떼는 키도 같이 삼킴)
+static V_SWALLOWED: AtomicBool = AtomicBool::new(false);
+static DOUBLE_TAP: Mutex<DoubleTap> = Mutex::new(DoubleTap::new());
+
+fn pressed(vk: u16) -> bool {
+    unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+}
+
+/// 저수준 키보드 훅. 키를 막지 않고 지켜보기만 하다가, Ctrl+C 가 짧은 간격으로
+/// 두 번 눌리면 메인 창에 알립니다. 훅은 빨리 끝나야 하므로 여기서는 메시지만 보냅니다.
+unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let k = &*(lp as *const KBDLLHOOKSTRUCT);
+        let msg = wp as u32;
+        let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let injected = k.flags & LLKHF_INJECTED != 0;
+        if !injected && k.vkCode == 'V' as u32 {
+            // 순차 붙여넣기: Ctrl+V 를 삼키고 메인 창이 다음 항목을 넣은 뒤 대신 붙여넣습니다.
+            if down {
+                if V_SWALLOWED.load(Ordering::Relaxed) {
+                    return 1; // 꾹 누르고 있을 때의 자동 반복
+                }
+                let only_ctrl = pressed(VK_CONTROL) && !pressed(VK_SHIFT) && !pressed(VK_MENU) && !pressed(VK_LWIN) && !pressed(VK_RWIN);
+                if only_ctrl && QUEUE_LEN.load(Ordering::Relaxed) > 0 && !util::is_own_window(GetForegroundWindow()) {
+                    let main = APP.load(Ordering::Relaxed);
+                    if !main.is_null() {
+                        V_SWALLOWED.store(true, Ordering::Relaxed);
+                        PostMessageW((*main).main, WM_APP_QUEUE_PASTE, 0, 0);
+                        return 1;
+                    }
+                }
+            } else if V_SWALLOWED.swap(false, Ordering::Relaxed) {
+                return 1;
+            }
+        }
+        if !injected && DOUBLE_COPY_MS.load(Ordering::Relaxed) > 0 {
+            if k.vkCode == 'C' as u32 {
+                if down {
+                    // 꾹 누르고 있을 때 생기는 자동 반복은 무시
+                    let repeat = C_HELD.swap(true, Ordering::Relaxed);
+                    let only_ctrl = pressed(VK_CONTROL)
+                        && !pressed(VK_SHIFT)
+                        && !pressed(VK_MENU)
+                        && !pressed(VK_LWIN)
+                        && !pressed(VK_RWIN);
+                    if !repeat && only_ctrl {
+                        let window = DOUBLE_COPY_MS.load(Ordering::Relaxed);
+                        let hit = DOUBLE_TAP.lock().map(|mut d| d.press(k.time, window)).unwrap_or(false);
+                        if hit {
+                            let main = APP.load(Ordering::Relaxed);
+                            if !main.is_null() {
+                                PostMessageW((*main).main, WM_APP_DOUBLE_COPY, 0, 0);
+                            }
+                        }
+                    } else if !repeat {
+                        if let Ok(mut d) = DOUBLE_TAP.lock() {
+                            d.reset();
+                        }
+                    }
+                } else {
+                    C_HELD.store(false, Ordering::Relaxed);
+                }
+            } else if down && !matches!(k.vkCode, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C) {
+                // 사이에 다른 키를 누르면 처음부터 다시 셉니다(Ctrl/Shift/Alt/Win 은 제외)
+                if let Ok(mut d) = DOUBLE_TAP.lock() {
+                    d.reset();
+                }
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}

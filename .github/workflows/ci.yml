@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-core:
+    name: 핵심 로직 테스트 (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib
+
+  build-windows:
+    name: Windows 빌드 + 실행 확인
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: 테스트
+        run: cargo test --lib
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+      - name: 릴리스 빌드
+        run: cargo build --release
+
+      - name: 실행 확인 (복사한 글이 기록되는지)
+        shell: pwsh
+        run: |
+          $dir = "target\release"
+          New-Item -ItemType Directory -Force -Path "$dir\data" | Out-Null   # 휴대용 모드
+          $p = Start-Process "$dir\clipstash.exe" -PassThru
+          Start-Sleep -Seconds 3
+          if ($p.HasExited) { throw "프로그램이 바로 종료되었습니다 (exit $($p.ExitCode))" }
+          if (-not (Test-Path "$dir\data\config.toml")) { throw "config.toml 이 만들어지지 않았습니다" }
+
+          $marker = "ClipStash smoke test 한글 $(Get-Random)"
+          Set-Clipboard -Value $marker
+          Start-Sleep -Seconds 4   # 저장은 1.5초 뒤에 한꺼번에
+          $json = Get-Content "$dir\data\history.json" -Raw -Encoding utf8
+          if ($json -notlike "*$marker*") { throw "복사한 글이 history.json 에 기록되지 않았습니다:`n$json" }
+          Write-Host "기록 확인: $marker"
+
+          # 두 번째 실행은 기존 프로그램에 신호만 보내고 바로 끝나야 합니다.
+          $p2 = Start-Process "$dir\clipstash.exe" -PassThru
+          if (-not $p2.WaitForExit(5000)) { throw "두 번째 실행이 끝나지 않았습니다(중복 실행 방지 실패)" }
+
+          Stop-Process -Id $p.Id -Force
+          Write-Host "OK"
+
+      - name: 클립보드 매니저 창 캡처
+        shell: pwsh
+        run: |
+          $dir = "target\release"
+          Remove-Item -Recurse -Force "$dir\data" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$dir\data" | Out-Null
+          $env:CLIPSTASH_MANAGER_SHOT = "$PWD\manager.bmp"
+          $p = Start-Process "$dir\clipstash.exe" -PassThru
+          if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force; throw "매니저 캡처가 끝나지 않았습니다" }
+          $env:CLIPSTASH_MANAGER_SHOT = $null
+          if (-not (Test-Path manager.bmp)) { throw "매니저 캡처 파일이 없습니다" }
+          Add-Type -AssemblyName System.Drawing
+          $img = [System.Drawing.Image]::FromFile("$PWD\manager.bmp")
+          $img.Save("$PWD\manager.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $img.Dispose()
+          Write-Host "캡처 완료"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manager-screenshot
+          path: manager.png
+
+      - name: 캡처를 ci-screens 브랜치에 올리기 (참고용)
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\manager.png"))
+          $path = "screens/manager-${{ github.sha }}.png"
+          $body = @{ message = "CI 캡처 ${{ github.sha }}"; content = $b64; branch = "ci-screens" } | ConvertTo-Json
+          $body | Out-File -Encoding utf8 body.json
+          gh api -X PUT "repos/${{ github.repository }}/contents/$path" --input body.json | Out-Null
+          Write-Host "올림: $path"
+
+      - name: 글자 추출(OCR)·HTTPS 점검 (참고용)
+        continue-on-error: true
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 900, 200
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::White)
+          $font = New-Object System.Drawing.Font "Arial", 48
+          $g.DrawString("Hello ClipStash 2026", $font, [System.Drawing.Brushes]::Black, 20, 50)
+          $bmp.Save("ocr.bmp", [System.Drawing.Imaging.ImageFormat]::Bmp)
+          $exe = "target\release\clipstash.exe"
+          Start-Process $exe -ArgumentList "--ocr-test", "ocr.bmp", "ocr.txt" -Wait
+          Write-Host "OCR 결과:"; Get-Content ocr.txt -Encoding utf8
+          Start-Process $exe -ArgumentList "--net-test", "net.txt" -Wait
+          Write-Host "HTTPS 결과:"; Get-Content net.txt -Encoding utf8
+          # AI 글자 추출: 저장소 비밀값 ANTHROPIC_API_KEY 가 있으면 실제로, 없으면 서버까지 요청이 가는지만(401) 확인
+          Start-Process $exe -ArgumentList "--ai-ocr-test", "ocr.bmp", "ai.txt" -Wait
+          Write-Host "AI 글자 추출 결과:"; Get-Content ai.txt -Encoding utf8
+          if (-not ((Get-Content ocr.txt -Raw) -match "Hello")) { throw "OCR 결과에 Hello 가 없습니다" }
+          $ai = Get-Content ai.txt -Raw -Encoding utf8
+          if ($env:ANTHROPIC_API_KEY) { if (-not ($ai -match "Hello")) { throw "AI 글자 추출 결과가 예상과 다릅니다" } }
+          elseif (-not ($ai -match "API 키")) { throw "AI 서버 요청이 예상과 다릅니다" }
+          if (-not ((Get-Content net.txt -Raw) -match "HTTP 4")) { throw "HTTPS 요청이 예상과 다릅니다" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipstash-windows-x64
+          path: target/release/clipstash.exe
