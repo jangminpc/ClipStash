@@ -4,6 +4,7 @@ mod backup;
 mod capture;
 mod clip;
 mod kakao;
+mod manager;
 mod net;
 mod ocr;
 mod paste;
@@ -49,6 +50,7 @@ pub const WM_APP_DOUBLE_COPY: u32 = WM_APP + 3;
 pub const WM_APP_QUEUE_PASTE: u32 = WM_APP + 4;
 const HOTKEY_ID: i32 = 1;
 const HOTKEY_CAPTURE: i32 = 2;
+const HOTKEY_MANAGER: i32 = 3;
 const TIMER_SAVE: usize = 1;
 const TIMER_SYNC: usize = 2;
 const MAIN_CLASS: &str = "ClipStash.Main";
@@ -75,6 +77,7 @@ const CMD_KAKAO: usize = 15;
 const CMD_KAKAO_OFF: usize = 16;
 const CMD_SYNC_NOW: usize = 17;
 const CMD_SETTINGS: usize = 18;
+const CMD_MANAGER: usize = 19;
 
 /// 항목을 골랐을 때 할 일
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -102,9 +105,11 @@ pub struct App {
     icon_paused: HICON,
     hotkey_ok: bool,
     capture_hotkey_ok: bool,
+    manager_hotkey_ok: bool,
     kb_hook: HHOOK,
     taskbar_created: u32,
     pub popup: popup::Popup,
+    pub manager: manager::Manager,
     pub capture: capture::Capture,
     /// 순차 붙여넣기 대기열(앞에서부터 붙여넣음)
     pub queue: VecDeque<u64>,
@@ -235,6 +240,7 @@ pub fn run() {
         RegisterClassExW(&wc);
         popup::register_classes(hinst);
         settings::register(hinst);
+        manager::register(hinst);
         capture::register_class(hinst);
 
         let app_box = Box::new(App {
@@ -250,6 +256,8 @@ pub fn run() {
             icon_paused,
             hotkey_ok: false,
             capture_hotkey_ok: false,
+            manager_hotkey_ok: false,
+            manager: manager::Manager::default(),
             kb_hook: null_mut(),
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             popup: popup::Popup::default(),
@@ -292,6 +300,7 @@ pub fn run() {
         // 다른 PC 와 동기화(설정했을 때만): 시작할 때 한 번, 그 뒤 1분마다
         a.sync_pull();
         SetTimer(main, TIMER_SYNC, 60_000, None);
+        manager::screenshot_test(a);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -322,11 +331,17 @@ impl App {
                 UnregisterHotKey(self.main, HOTKEY_CAPTURE);
                 self.capture_hotkey_ok = false;
             }
+            if self.manager_hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_MANAGER);
+                self.manager_hotkey_ok = false;
+            }
         }
         let main_hk = self.config.hotkey.clone();
         let cap_hk = self.config.capture_hotkey.clone();
         self.hotkey_ok = self.register_one(HOTKEY_ID, &main_hk, "hotkey");
         self.capture_hotkey_ok = self.register_one(HOTKEY_CAPTURE, &cap_hk, "capture_hotkey");
+        let mgr_hk = self.config.manager_hotkey.clone();
+        self.manager_hotkey_ok = self.register_one(HOTKEY_MANAGER, &mgr_hk, "manager_hotkey");
         self.tray(NIM_MODIFY);
     }
 
@@ -443,6 +458,9 @@ impl App {
             if self.capture_hotkey_ok {
                 UnregisterHotKey(self.main, HOTKEY_CAPTURE);
             }
+            if self.manager_hotkey_ok {
+                UnregisterHotKey(self.main, HOTKEY_MANAGER);
+            }
             if !self.kb_hook.is_null() {
                 UnhookWindowsHookEx(self.kb_hook);
             }
@@ -469,7 +487,9 @@ impl App {
         };
         match Config::from_toml(&text) {
             Ok(c) => {
-                let hotkey_changed = c.hotkey != self.config.hotkey || c.capture_hotkey != self.config.capture_hotkey;
+                let hotkey_changed = c.hotkey != self.config.hotkey
+                    || c.capture_hotkey != self.config.capture_hotkey
+                    || c.manager_hotkey != self.config.manager_hotkey;
                 let sync_changed = c.sync_folder != self.config.sync_folder;
                 self.config = c;
                 if sync_changed {
@@ -1051,7 +1071,13 @@ impl App {
                 AppendMenuW(m, flags, id, t.as_ptr());
             };
             let checked = |b: bool| if b { MF_CHECKED } else { MF_UNCHECKED };
-            add(MF_STRING, CMD_OPEN, &format!("기록 열기\t{}", self.config.shortcut_label()));
+            let mgr = if self.config.manager_hotkey.trim().is_empty() {
+                "클립보드 매니저 열기".to_string()
+            } else {
+                format!("클립보드 매니저 열기\t{}", self.config.manager_hotkey)
+            };
+            add(MF_STRING, CMD_MANAGER, &mgr);
+            add(MF_STRING, CMD_OPEN, &format!("빠른 팝업 열기\t{}", self.config.shortcut_label()));
             let cap = if self.config.capture_hotkey.trim().is_empty() {
                 "화면 캡처".to_string()
             } else {
@@ -1089,7 +1115,7 @@ impl App {
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, CMD_ABOUT, "ClipStash 정보");
             add(MF_STRING, CMD_EXIT, "종료");
-            SetMenuDefaultItem(m, CMD_OPEN as u32, 0);
+            SetMenuDefaultItem(m, CMD_MANAGER as u32, 0);
 
             let mut pt = POINT { x: 0, y: 0 };
             GetCursorPos(&mut pt);
@@ -1134,6 +1160,7 @@ impl App {
                 }
             }
             CMD_SETTINGS => settings::open(self),
+            CMD_MANAGER => manager::open(self),
             CMD_EDIT_CONFIG => self.open_config_file(),
             CMD_RELOAD => self.reload_config(true),
             CMD_DATA_DIR => util::shell_open(&self.data_dir.display().to_string(), None),
@@ -1190,6 +1217,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             0
         }
+        WM_HOTKEY if wp as i32 == HOTKEY_MANAGER => {
+            manager::toggle(a);
+            0
+        }
         WM_HOTKEY if wp as i32 == HOTKEY_CAPTURE => {
             capture::start(a, false);
             0
@@ -1220,7 +1251,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             // NOTIFYICON_VERSION_4: LOWORD(lParam) 가 이벤트
             match (lp as u32) & 0xFFFF {
                 // 왼쪽 클릭/키보드 선택 → 팝업, 오른쪽 클릭 → 메뉴
-                TRAY_SELECT | TRAY_KEYSELECT => popup::show(a, null_mut(), true),
+                TRAY_SELECT | TRAY_KEYSELECT => manager::open(a),
                 WM_CONTEXTMENU => a.show_tray_menu(),
                 _ => {}
             }

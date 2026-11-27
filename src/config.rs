@@ -26,6 +26,8 @@ pub enum Theme {
 pub struct Config {
     pub hotkey: String,
     pub capture_hotkey: String,
+    /// 클립보드 매니저 창을 여는 단축키
+    pub manager_hotkey: String,
     pub double_copy_ms: u32,
     pub max_items: usize,
     pub capture_text: bool,
@@ -65,6 +67,7 @@ impl Default for Config {
         Config {
             hotkey: "Alt+C".into(),
             capture_hotkey: "Ctrl+Alt+C".into(),
+            manager_hotkey: "Ctrl+Alt+V".into(),
             double_copy_ms: 0,
             max_items: 1000,
             capture_text: true,
@@ -263,6 +266,9 @@ hotkey = "Alt+C"
 # 화면 일부를 마우스로 잘라서 기록에 넣는 단축키(트레이 메뉴에도 있음). 끄려면 ""
 capture_hotkey = "Ctrl+Alt+C"
 
+# 클립보드 매니저 창(분류·태그·검색·미리보기)을 여는 단축키. 트레이 아이콘 클릭으로도 열림. 끄려면 ""
+manager_hotkey = "Ctrl+Alt+V"
+
 # Ctrl+C 를 빠르게 두 번 눌러도 팝업 열기(한 번 누르면 평소처럼 복사만).
 # 두 번 누르는 사이 허용 시간(밀리초, 예: 400). 0 이면 끔.
 double_copy_ms = 0
@@ -391,6 +397,7 @@ mod tests {
         assert_eq!(c, Config::default());
         assert!(crate::hotkey::parse(&c.hotkey).is_ok());
         assert!(crate::hotkey::parse(&c.capture_hotkey).is_ok());
+        assert!(crate::hotkey::parse(&c.manager_hotkey).is_ok());
     }
 
     #[test]

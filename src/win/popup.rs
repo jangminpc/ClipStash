@@ -708,6 +708,7 @@ pub fn refresh(a: &mut App) {
 }
 
 pub fn on_history_changed(a: &mut App) {
+    super::manager::on_history_changed(a);
     if a.popup.visible() {
         refresh(a);
     }

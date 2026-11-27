@@ -56,9 +56,93 @@ pub struct ClipItem {
     pub pinned: bool,
     #[serde(default)]
     pub use_count: u32,
+    /// 즐겨찾기(별표)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub favorite: bool,
+    /// 사용자가 붙인 태그
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// 매니저 창 왼쪽의 종류 분류. 한 항목은 정확히 하나의 종류에 들어갑니다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Category {
+    Image,
+    Text,
+    Files,
+    Link,
+    Html,
+    Code,
+}
+
+impl Category {
+    pub const ALL: [Category; 6] = [Category::Image, Category::Text, Category::Files, Category::Link, Category::Html, Category::Code];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Image => "이미지",
+            Category::Text => "텍스트",
+            Category::Files => "파일/폴더",
+            Category::Link => "링크(URL)",
+            Category::Html => "HTML",
+            Category::Code => "코드",
+        }
+    }
+}
+
+/// 한 줄짜리 URL 인지
+pub fn is_link(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return false;
+    }
+    let l = t.to_ascii_lowercase();
+    l.starts_with("http://") || l.starts_with("https://") || l.starts_with("ftp://") || l.starts_with("www.")
+}
+
+/// 프로그램 코드처럼 보이는지(대략적인 판단)
+pub fn looks_like_code(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return false;
+    }
+    const KEYWORDS: [&str; 22] = [
+        "fn ", "let ", "const ", "function ", "def ", "class ", "import ", "#include", "public ", "private ", "return ",
+        "var ", "if (", "for (", "while (", "=> ", "println!", "console.log", "SELECT ", "#!/", "using ", "package ",
+    ];
+    let mut score = 0;
+    for l in &lines {
+        let t = l.trim();
+        if t.ends_with(';') || t.ends_with('{') || t == "}" || t.ends_with("):") || t.starts_with("//") {
+            score += 2;
+        }
+        if KEYWORDS.iter().any(|k| t.starts_with(k) || t.contains(&format!(" {}", k))) {
+            score += 2;
+        }
+        if l.starts_with("    ") || l.starts_with('\t') {
+            score += 1;
+        }
+    }
+    score >= 3 && score * 2 >= lines.len() * 2
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let t = text.trim_start().to_ascii_lowercase();
+    t.starts_with("<!doctype html") || t.starts_with("<html") || (t.starts_with('<') && t.contains("</") && t.trim_end().ends_with('>'))
 }
 
 impl ClipItem {
+    pub fn category(&self) -> Category {
+        match &self.content {
+            ClipContent::Image { .. } => Category::Image,
+            ClipContent::Files { .. } => Category::Files,
+            ClipContent::Text { text, .. } if is_link(text) => Category::Link,
+            ClipContent::Text { text, .. } if looks_like_html(text) => Category::Html,
+            ClipContent::Text { text, .. } if looks_like_code(text) => Category::Code,
+            ClipContent::Text { .. } => Category::Text,
+        }
+    }
+
     /// 목록에 보여줄 한 줄 미리보기.
     pub fn preview(&self, max_chars: usize) -> String {
         match &self.content {
@@ -86,6 +170,10 @@ impl ClipItem {
         if let Some(app) = &self.source_app {
             s.push(' ');
             s.push_str(app);
+        }
+        for t in &self.tags {
+            s.push(' ');
+            s.push_str(t);
         }
         s
     }
@@ -124,6 +212,42 @@ pub fn one_line(text: &str, max_chars: usize) -> String {
         count += 1;
     }
     out
+}
+
+/// 1970-01-01 부터의 날 수 → (년, 월, 일)
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// (년, 월, 일) → 1970-01-01 부터의 날 수
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// "2026-11-27 (금) 20:54:12" (offset_secs = 현지 시간 - UTC)
+pub fn format_datetime(ts: i64, offset_secs: i64) -> String {
+    let t = ts + offset_secs;
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    const WD: [&str; 7] = ["목", "금", "토", "일", "월", "화", "수"]; // 1970-01-01 은 목요일
+    let wd = WD[days.rem_euclid(7) as usize];
+    format!("{}-{:02}-{:02} ({}) {:02}:{:02}:{:02}", y, m, d, wd, secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
 /// "방금", "5분 전" 같은 상대 시간.
@@ -230,6 +354,8 @@ impl History {
                 source_app,
                 pinned: false,
                 use_count: 0,
+                favorite: false,
+                tags: Vec::new(),
             },
         );
         AddOutcome { id, was_duplicate: false, evicted: self.trim(max_items) }
@@ -319,6 +445,39 @@ impl History {
             || removed_before > 0
             || out.removed[removed_before..].iter().any(|r| !new_ids.contains(&r.id));
         out
+    }
+
+    pub fn toggle_favorite(&mut self, id: u64) -> Option<bool> {
+        let item = self.items.iter_mut().find(|i| i.id == id)?;
+        item.favorite = !item.favorite;
+        Some(item.favorite)
+    }
+
+    /// 태그를 붙이거나(없으면) 떼거나(있으면). 붙였으면 true.
+    pub fn toggle_tag(&mut self, id: u64, tag: &str) -> Option<bool> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return None;
+        }
+        let item = self.items.iter_mut().find(|i| i.id == id)?;
+        if let Some(pos) = item.tags.iter().position(|t| t == tag) {
+            item.tags.remove(pos);
+            Some(false)
+        } else {
+            item.tags.push(tag.to_string());
+            Some(true)
+        }
+    }
+
+    /// 쓰이고 있는 태그와 개수(이름 순)
+    pub fn tag_counts(&self) -> Vec<(String, usize)> {
+        let mut m: std::collections::BTreeMap<&str, usize> = Default::default();
+        for i in &self.items {
+            for t in &i.tags {
+                *m.entry(t.as_str()).or_default() += 1;
+            }
+        }
+        m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 
     pub fn toggle_pin(&mut self, id: u64) -> Option<bool> {
@@ -525,7 +684,52 @@ mod tests {
             source_app: None,
             pinned: false,
             use_count: 0,
+            favorite: false,
+            tags: Vec::new(),
         };
         assert_eq!(item.preview(100), "[파일 2개] x.txt, folder");
+    }
+
+    #[test]
+    fn categories() {
+        let mut h = History::new();
+        let t = |h: &mut History, s: &str| add_text(h, s, 0, 100).id;
+        let link = t(&mut h, "https://example.com/a?b=1");
+        let text = t(&mut h, "안녕하세요 반갑습니다");
+        let code = t(&mut h, "fn main() {\n    println!(\"hi\");\n}");
+        let html = t(&mut h, "<div class=\"a\">hi</div>");
+        let cat = |id| h.get(id).unwrap().category();
+        assert_eq!(cat(link), Category::Link);
+        assert_eq!(cat(text), Category::Text);
+        assert_eq!(cat(code), Category::Code);
+        assert_eq!(cat(html), Category::Html);
+        assert!(!is_link("see https://x.com"));
+        assert!(!looks_like_code("오늘 회의는 3시입니다.\n장소: 2층"));
+    }
+
+    #[test]
+    fn favorites_and_tags() {
+        let mut h = History::new();
+        let a = add_text(&mut h, "a", 0, 100).id;
+        assert_eq!(h.toggle_favorite(a), Some(true));
+        assert_eq!(h.toggle_tag(a, " 업무 "), Some(true));
+        assert_eq!(h.toggle_tag(a, "서버"), Some(true));
+        assert_eq!(h.tag_counts(), vec![("서버".to_string(), 1), ("업무".to_string(), 1)]);
+        assert_eq!(h.toggle_tag(a, "업무"), Some(false));
+        assert!(h.get(a).unwrap().search_text().contains("서버"));
+        // 저장 형식: 기본값이면 쓰지 않음, 예전 파일도 읽힘
+        let json = serde_json::to_string(h.get(a).unwrap()).unwrap();
+        assert!(json.contains("\"favorite\":true") && json.contains("서버"));
+        let old: ClipItem = serde_json::from_str(r#"{"id":1,"content":{"kind":"text","text":"x"},"hash":"","created":0,"last_used":0}"#).unwrap();
+        assert!(!old.favorite && old.tags.is_empty());
+    }
+
+    #[test]
+    fn datetime() {
+        assert_eq!(format_datetime(0, 0), "1970-01-01 (목) 00:00:00");
+        // 2026-11-27 11:54:12 UTC = 20:54:12 KST
+        let ts = days_from_civil(2026, 11, 27) * 86_400 + 11 * 3600 + 54 * 60 + 12;
+        assert_eq!(format_datetime(ts, 9 * 3600), "2026-11-27 (금) 20:54:12");
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
     }
 }

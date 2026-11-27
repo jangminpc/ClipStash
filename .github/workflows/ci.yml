@@ -54,6 +54,28 @@ jobs:
           Stop-Process -Id $p.Id -Force
           Write-Host "OK"
 
+      - name: 클립보드 매니저 창 캡처
+        shell: pwsh
+        run: |
+          $dir = "target\release"
+          Remove-Item -Recurse -Force "$dir\data" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$dir\data" | Out-Null
+          $env:CLIPSTASH_MANAGER_SHOT = "$PWD\manager.bmp"
+          $p = Start-Process "$dir\clipstash.exe" -PassThru
+          if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force; throw "매니저 캡처가 끝나지 않았습니다" }
+          $env:CLIPSTASH_MANAGER_SHOT = $null
+          if (-not (Test-Path manager.bmp)) { throw "매니저 캡처 파일이 없습니다" }
+          Add-Type -AssemblyName System.Drawing
+          $img = [System.Drawing.Image]::FromFile("$PWD\manager.bmp")
+          $img.Save("$PWD\manager.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $img.Dispose()
+          Write-Host "캡처 완료"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manager-screenshot
+          path: manager.png
+
       - name: 글자 추출(OCR)·HTTPS 점검 (참고용)
         continue-on-error: true
         shell: pwsh
