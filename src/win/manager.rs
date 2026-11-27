@@ -1045,7 +1045,7 @@ unsafe fn paint_right(a: &mut App, dc: HDC, g: &Geo) {
         (IC_PASTE, "사용 횟수", format!("{}번", i.use_count)),
     ];
     let mut y = head.bottom + s(2);
-    let label_w = if dt.right - dt.left < s(300) { s(78) } else { s(100) };
+    let label_w = if dt.right - dt.left < s(300) { s(92) } else { s(104) };
     for (ic, label, value) in rows {
         // 값이 몇 줄로 그려질지 재서 줄 높이를 정합니다.
         let vw = (dt.right - s(12)) - (dt.left + s(14) + label_w + s(30));
@@ -1118,9 +1118,17 @@ unsafe fn paint_bottom(a: &mut App, dc: HDC, g: &Geo) {
         (Tool::Delete, IC_DELETE, "삭제", PANEL2, DANGER),
         (Tool::More, IC_MORE, "", PANEL2, TEXT),
     ];
+    // 자리가 모자라면 단축키 표시를 빼고 짧게
+    let avail = b.right - b.left - s(160);
+    let full: i32 = buttons.iter().map(|(_, _, l, _, _)| if l.is_empty() { s(46) } else { text_w(dc, l, m.font) + s(56) }).sum::<i32>() + s(50);
+    let short = full > avail;
+    let buttons: Vec<(Tool, char, String, COLORREF, COLORREF)> = buttons
+        .into_iter()
+        .map(|(t, ic, l, bg, fg)| (t, ic, if short { l.split(" (").next().unwrap_or(l).to_string() } else { l.to_string() }, bg, fg))
+        .collect();
     let widths: Vec<i32> = buttons
         .iter()
-        .map(|(_, _, l, _, _)| if l.is_empty() { s(46) } else { text_w(dc, l, m.font) + s(56) })
+        .map(|(_, _, l, _, _)| if l.is_empty() { s(46) } else { text_w(dc, l, m.font) + s(if short { 48 } else { 56 }) })
         .collect();
     let total: i32 = widths.iter().sum::<i32>() + s(10) * (widths.len() as i32 - 1);
     let mut x = (b.left + s(150)).max((b.left + b.right - total) / 2);
@@ -1134,7 +1142,7 @@ unsafe fn paint_bottom(a: &mut App, dc: HDC, g: &Geo) {
             icon(dc, m, ic, &r, fg);
         } else {
             icon(dc, m, ic, &RECT { left: r.left + s(10), right: r.left + s(36), ..r }, fg);
-            line_text(dc, label, &RECT { left: r.left + s(38), ..r }, fg, m.font);
+            line_text(dc, &label, &RECT { left: r.left + s(38), ..r }, fg, m.font);
         }
         m.hits.push((r, Hit::Tool(tool)));
         x += w + s(10);
@@ -1180,9 +1188,10 @@ unsafe fn draw_row(a: &mut App, dis: &DRAWITEMSTRUCT) {
     text(dc, &(idx + 1).to_string(), &nr, MUTED, a.manager.font_small, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
     let w = rc.right - rc.left;
     let star_x = rc.right - s(34);
-    let time_r = RECT { left: rc.right - s(120), top: rc.top, right: star_x - s(8), bottom: rc.bottom };
-    let app_r = RECT { left: rc.right - s(250), top: rc.top, right: time_r.left - s(8), bottom: rc.bottom };
-    let narrow = w < s(560);
+    let time_r = RECT { left: rc.right - s(110), top: rc.top, right: star_x - s(8), bottom: rc.bottom };
+    let app_w = if w < s(640) { s(118) } else { s(150) };
+    let app_r = RECT { left: time_r.left - s(8) - app_w, top: rc.top, right: time_r.left - s(8), bottom: rc.bottom };
+    let narrow = w < s(430);
     let thumb_box = RECT { left: rc.left + s(72), top: rc.top + s(3), right: rc.left + s(132), bottom: rc.bottom - s(3) };
     let title_r = RECT { left: thumb_box.right + s(10), top: rc.top, right: if narrow { time_r.left - s(8) } else { app_r.left - s(10) }, bottom: rc.bottom };
 
