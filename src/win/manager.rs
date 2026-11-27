@@ -1045,10 +1045,18 @@ unsafe fn paint_right(a: &mut App, dc: HDC, g: &Geo) {
         (IC_PASTE, "사용 횟수", format!("{}번", i.use_count)),
     ];
     let mut y = head.bottom + s(2);
-    let label_w = s(104);
+    let label_w = if dt.right - dt.left < s(300) { s(78) } else { s(100) };
     for (ic, label, value) in rows {
-        let lines = value.lines().count().max(1) as i32;
-        let h = s(26) + (lines - 1) * s(18);
+        // 값이 몇 줄로 그려질지 재서 줄 높이를 정합니다.
+        let vw = (dt.right - s(12)) - (dt.left + s(14) + label_w + s(30));
+        let mut calc = RECT { left: 0, top: 0, right: vw.max(s(40)), bottom: 0 };
+        {
+            let mut wv: Vec<u16> = value.encode_utf16().collect();
+            let old = SelectObject(dc, m.font_small as HGDIOBJ);
+            DrawTextW(dc, wv.as_mut_ptr(), wv.len() as i32, &mut calc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+            SelectObject(dc, old);
+        }
+        let h = (calc.bottom + s(10)).max(s(26));
         let r = RECT { left: dt.left + s(14), top: y, right: dt.right - s(12), bottom: y + h };
         icon(dc, m, ic, &RECT { right: r.left + s(20), bottom: r.top + s(26), ..r }, MUTED);
         line_text(dc, label, &RECT { left: r.left + s(28), right: r.left + label_w + s(28), bottom: r.top + s(26), ..r }, MUTED, m.font_small);
@@ -2052,7 +2060,8 @@ unsafe fn take_shot(hwnd: HWND) {
     let mem = CreateCompatibleDC(screen);
     let bmp_h = CreateCompatibleBitmap(screen, w, h);
     let old = SelectObject(mem, bmp_h as HGDIOBJ);
-    BitBlt(mem, 0, 0, w, h, screen, wr.left, wr.top, SRCCOPY);
+    // 화면보다 커도 창 전체를 그려 받기(PW_RENDERFULLCONTENT)
+    windows_sys::Win32::Storage::Xps::PrintWindow(hwnd, mem, 2);
     SelectObject(mem, old);
     let mut bi: BITMAPINFO = std::mem::zeroed();
     bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
